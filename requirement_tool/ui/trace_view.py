@@ -1,12 +1,13 @@
 """Traceability matrix view used by the main window."""
 from __future__ import annotations
 
-from typing import Iterable, List, Sequence
+from typing import Callable, Iterable, List, Optional, Sequence
 
 import logging
 
 import pandas as pd
 from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QFileDialog,
     QLabel,
@@ -32,6 +33,13 @@ class TraceMatrixView(QWidget):
         self.current_rows: List[Sequence[str]] = []
         self.current_cols: List[str] = []
         self.active_filters: dict[str, set[str]] = {}
+        self.current_row_indices: List[int] = []
+        self._filtered_row_indices: List[int] = []
+        self._link_columns: set[int] = set()
+        self.current_sources: List[str] = []
+        self._filtered_row_sources: List[str] = []
+        self.navigate_to_requirement: Optional[Callable[[str, Optional[str]], None]] = None
+        self._row_index_column: Optional[str] = None
 
         layout = QVBoxLayout(self)
         self.info_label = QLabel(
@@ -59,12 +67,20 @@ class TraceMatrixView(QWidget):
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.horizontalHeader().setSectionsClickable(True)
         self.table.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
+        self.table.cellActivated.connect(self._on_cell_triggered)
+        self.table.cellClicked.connect(self._on_cell_triggered)
         layout.addWidget(self.table)
 
     # ------------------------------------------------------------------
     def load_data(self, df: pd.DataFrame) -> None:
         self._df = df.copy() if df is not None else pd.DataFrame()
         self.active_filters.clear()
+        self._row_index_column = None
+        if not self._df.empty:
+            for candidate in ("_row_index", "__row_index__", "RowIndex"):
+                if candidate in self._df.columns:
+                    self._row_index_column = candidate
+                    break
         self.show_forward_trace()
 
     # ------------------------------------------------------------------
@@ -79,10 +95,42 @@ class TraceMatrixView(QWidget):
             self._clear_table("Required columns not found for forward trace.")
             return
 
-        cols = [req_col, up_col, "Object Text"]
-        rows = [tuple(self._df[c].iloc[i] for c in cols) for i in range(len(self._df))]
+        cols = ["SourceFile", req_col, up_col, "Object Text"]
+        rows: List[Sequence[str]] = []
+        indices: List[int] = []
+        sources: List[str] = []
+        for i in range(len(self._df)):
+            source_index = self._df.index[i]
+            source_value = (
+                str(self._df.at[source_index, "SourceFile"])
+                if "SourceFile" in self._df.columns
+                else ""
+            )
+            row_values: List[str] = [
+                source_value,
+                str(self._df.at[source_index, req_col])
+                if req_col in self._df.columns
+                else "",
+                str(self._df.at[source_index, up_col])
+                if up_col in self._df.columns
+                else "",
+                str(self._df.at[source_index, "Object Text"])
+                if "Object Text" in self._df.columns
+                else "",
+            ]
+            rows.append(tuple(row_values))
+            indices.append(self._extract_row_index(i))
+            source_type = (
+                str(self._df.at[source_index, "SourceType"]).strip().lower()
+                if "SourceType" in self._df.columns
+                else ""
+            )
+            normalized_source = (
+                "Excel" if source_type == "excel" else (source_value or "Manual")
+            )
+            sources.append(normalized_source or "Manual")
 
-        self._update_table(cols, rows, "Forward Trace")
+        self._update_table(cols, rows, "Forward Trace", indices, sources)
 
     # ------------------------------------------------------------------
     def show_backward_trace(self) -> None:
@@ -96,9 +144,41 @@ class TraceMatrixView(QWidget):
             self._clear_table("Required columns not found for backward trace.")
             return
 
-        cols = [up_col, req_col, "Object Text"]
-        rows = [tuple(self._df[c].iloc[i] for c in cols) for i in range(len(self._df))]
-        self._update_table(cols, rows, "Backward Trace")
+        cols = ["SourceFile", up_col, req_col, "Object Text"]
+        rows: List[Sequence[str]] = []
+        indices: List[int] = []
+        sources: List[str] = []
+        for i in range(len(self._df)):
+            source_index = self._df.index[i]
+            source_value = (
+                str(self._df.at[source_index, "SourceFile"])
+                if "SourceFile" in self._df.columns
+                else ""
+            )
+            row_values: List[str] = [
+                source_value,
+                str(self._df.at[source_index, up_col])
+                if up_col in self._df.columns
+                else "",
+                str(self._df.at[source_index, req_col])
+                if req_col in self._df.columns
+                else "",
+                str(self._df.at[source_index, "Object Text"])
+                if "Object Text" in self._df.columns
+                else "",
+            ]
+            rows.append(tuple(row_values))
+            indices.append(self._extract_row_index(i))
+            source_type = (
+                str(self._df.at[source_index, "SourceType"]).strip().lower()
+                if "SourceType" in self._df.columns
+                else ""
+            )
+            normalized_source = (
+                "Excel" if source_type == "excel" else (source_value or "Manual")
+            )
+            sources.append(normalized_source or "Manual")
+        self._update_table(cols, rows, "Backward Trace", indices, sources)
 
     # ------------------------------------------------------------------
     def _detect_column(self, candidates: Iterable[str]) -> str | None:
@@ -113,10 +193,28 @@ class TraceMatrixView(QWidget):
 
     # ------------------------------------------------------------------
     def _update_table(
-        self, columns: Sequence[str], rows: Sequence[Sequence[str]], mode: str
+        self,
+        columns: Sequence[str],
+        rows: Sequence[Sequence[str]],
+        mode: str,
+        row_indices: Sequence[int] | None = None,
+        row_sources: Sequence[str] | None = None,
     ) -> None:
         self.current_cols = list(columns)
         self.current_rows = [tuple(str(v) for v in row) for row in rows]
+        if row_indices is None:
+            self.current_row_indices = list(range(len(self.current_rows)))
+        else:
+            self.current_row_indices = list(row_indices)
+        if row_sources is None:
+            self.current_sources = [""] * len(self.current_rows)
+        else:
+            self.current_sources = list(row_sources)
+        self._link_columns = {
+            idx
+            for idx, name in enumerate(self.current_cols)
+            if self._is_link_column(name)
+        }
         self.info_label.setText(f"Traceability Matrix ({mode})")
         self._populate_table_from_current()
 
@@ -126,23 +224,36 @@ class TraceMatrixView(QWidget):
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
         self.info_label.setText(message)
+        self._filtered_row_indices = []
+        self._filtered_row_sources = []
+        self.current_sources = []
 
     # ------------------------------------------------------------------
     def _populate_table_from_current(self) -> None:
         rows = self.current_rows
         cols = self.current_cols
+        indices = self.current_row_indices
+        sources = self.current_sources
         if self.active_filters:
-            filtered: List[Sequence[str]] = []
-            for row in rows:
+            filtered_rows: List[Sequence[str]] = []
+            filtered_indices: List[int] = []
+            filtered_sources: List[str] = []
+            for row, idx, source in zip(rows, indices, sources):
                 include = True
-                for idx, column in enumerate(cols):
+                for col_idx, column in enumerate(cols):
                     selected = self.active_filters.get(column)
-                    if selected and row[idx] not in selected:
+                    if selected and row[col_idx] not in selected:
                         include = False
                         break
                 if include:
-                    filtered.append(row)
-            rows = filtered
+                    filtered_rows.append(row)
+                    filtered_indices.append(idx)
+                    filtered_sources.append(source)
+            rows = filtered_rows
+            indices = filtered_indices
+            sources = filtered_sources
+        self._filtered_row_indices = list(indices)
+        self._filtered_row_sources = list(sources)
 
         self.table.clear()
         self.table.setColumnCount(len(cols))
@@ -153,9 +264,64 @@ class TraceMatrixView(QWidget):
             for j, value in enumerate(row):
                 item = QTableWidgetItem(str(value))
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if j in self._link_columns and str(value).strip():
+                    font = QFont(item.font())
+                    font.setUnderline(True)
+                    item.setFont(font)
+                    item.setForeground(Qt.GlobalColor.blue)
                 self.table.setItem(i, j, item)
 
         self.table.resizeColumnsToContents()
+
+    # ------------------------------------------------------------------
+    def _is_link_column(self, name: str) -> bool:
+        lowered = name.strip().lower()
+        return lowered in {
+            "requirement id",
+            "req id",
+            "reqid",
+            "up trace",
+            "uptrace",
+        }
+
+    # ------------------------------------------------------------------
+    def _extract_row_index(self, position: int) -> int:
+        if (
+            self._row_index_column
+            and self._row_index_column in self._df.columns
+            and not self._df.empty
+        ):
+            source_index = self._df.index[position]
+            value = self._df.at[source_index, self._row_index_column]
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                try:
+                    return int(float(value))
+                except (TypeError, ValueError):
+                    return int(position)
+        return int(position)
+
+    # ------------------------------------------------------------------
+    def _on_cell_triggered(self, row: int, column: int) -> None:
+        if column < 0 or column >= len(self.current_cols):
+            return
+        if column not in self._link_columns:
+            return
+        if row < 0 or row >= len(self._filtered_row_indices):
+            return
+        item = self.table.item(row, column)
+        if item is None:
+            return
+        target = item.text().strip()
+        if not target:
+            return
+        handler = self.navigate_to_requirement
+        if handler:
+            source = ""
+            if row < len(self._filtered_row_sources):
+                source = self._filtered_row_sources[row]
+            handler(target, source)
 
     # ------------------------------------------------------------------
     def _on_header_clicked(self, index: int) -> None:
@@ -278,4 +444,4 @@ class TraceMatrixView(QWidget):
             QMessageBox.information(self, "Saved", f"Trace saved to {file_name}")
             parent = self.parent()
             if parent and hasattr(parent, "log_console"):
-                parent.log_console(f"💾 Trace saved to {file_name}")
+                parent.log_console(f"Trace saved to {file_name}")
