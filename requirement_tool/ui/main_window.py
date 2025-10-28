@@ -1705,73 +1705,75 @@ class MainWindow(QMainWindow):
         tail_run.font.color.rgb = RGBColor(0, 0, 0)
 
 
-def _apply_watermark(self, document, text: str, parse_xml, nsdecls) -> None:
-    safe_text = (text or "").strip()
-    if not safe_text:
-        return
-    safe_text = html.escape(safe_text).replace('"', "'")
-    section = document.sections[0]
-    header = section.header
-    nsmap = {"v": "urn:schemas-microsoft-com:vml"}
-    for shape in header._element.xpath(".//v:shape[contains(@id,'PowerPlusWaterMarkObject')]", namespaces=nsmap):
-        parent = shape.getparent()
-        if parent is not None:
-            parent.remove(shape)
-    for shapetype in header._element.xpath(".//v:shapetype[@id='_x0000_t136']", namespaces=nsmap):
-        parent = shapetype.getparent()
-        if parent is not None:
-            parent.remove(shapetype)
+    def _apply_watermark(self, document, text: str, parse_xml, nsdecls) -> None:
+        safe_text = (text or "").strip()
+        if not safe_text:
+            return
+        safe_text = html.escape(safe_text).replace('"', "'")
+        section = document.sections[0]
+        header = section.header
+        ns_v = "{urn:schemas-microsoft-com:vml}"
+        for shape in header._element.findall(f".//{ns_v}shape"):
+            if "PowerPlusWaterMarkObject" in (shape.get("id") or ""):
+                parent = shape.getparent()
+                if parent is not None:
+                    parent.remove(shape)
+        for shapetype in header._element.findall(f".//{ns_v}shapetype"):
+            if shapetype.get("id") == "_x0000_t136":
+                parent = shapetype.getparent()
+                if parent is not None:
+                    parent.remove(shapetype)
 
-    watermark_xml = (
-        '<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
-        'xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" '
-        'xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns:w10="urn:schemas-microsoft-com:office:word">'
-        '<w:r><w:pict>'
-        '<v:shapetype id="_x0000_t136" coordsize="21600,21600" o:spt="136" o:connecttype="custom" '
-        'path="m@7,l@8,m@5,21600l@6,21600e" filled="f" stroked="f">'
-        '<v:formulas>'
-        '<v:f eqn="if lineDrawn pixelLineWidth 0"/>'
-        '<v:f eqn="sum @0 1 0"/>'
-        '<v:f eqn="sum 0 0 @1"/>'
-        '<v:f eqn="prod @2 1 2"/>'
-        '<v:f eqn="prod @3 21600 pixelWidth"/>'
-        '<v:f eqn="prod @3 21600 pixelHeight"/>'
-        '<v:f eqn="sum @0 0 1"/>'
-        '<v:f eqn="prod @6 1 2"/>'
-        '<v:f eqn="prod @7 21600 pixelWidth"/>'
-        '<v:f eqn="prod @7 21600 pixelHeight"/>'
-        '</v:formulas>'
-        '<v:path o:extrusionok="f" gradientshapeok="t" o:connecttype="custom" '
-        'connectlocs="@5,0;@6,21600;@8,0;@9,21600"/>'
-        '<o:lock v:ext="edit" text="t" shapetype="t"/>'
-        '</v:shapetype>'
-        '<v:shape id="PowerPlusWaterMarkObject" o:spid="_x0000_s1025" type="#_x0000_t136" '
-        'style="position:absolute;margin-left:0;margin-top:0;width:468pt;height:468pt;rotation:315;z-index:-251658240;visibility:visible;mso-wrap-edited:f" '
-        'o:allowincell="f" fillcolor="gray" stroked="f">'
-        '<v:fill opacity="0.1" />'
-        f"<v:textpath style=\"font-family:'Calibri';font-size:48pt\" string=\"{safe_text}\"/>"
-        '</v:shape>'
-        '</w:pict></w:r></w:p>'
-    )
-    header._element.append(parse_xml(watermark_xml))
+        watermark_xml = (
+            '<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+            'xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" '
+            'xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns:w10="urn:schemas-microsoft-com:office:word">'
+            "<w:r><w:pict>"
+            '<v:shapetype id="_x0000_t136" coordsize="21600,21600" o:spt="136" o:connecttype="custom" '
+            'path="m@7,l@8,m@5,21600l@6,21600e" filled="f" stroked="f">'
+            "<v:formulas>"
+            "<v:f eqn=\"if lineDrawn pixelLineWidth 0\"/>"
+            "<v:f eqn=\"sum @0 1 0\"/>"
+            "<v:f eqn=\"sum 0 0 @1\"/>"
+            "<v:f eqn=\"prod @2 1 2\"/>"
+            "<v:f eqn=\"prod @3 21600 pixelWidth\"/>"
+            "<v:f eqn=\"prod @3 21600 pixelHeight\"/>"
+            "<v:f eqn=\"sum @0 0 1\"/>"
+            "<v:f eqn=\"prod @6 1 2\"/>"
+            "<v:f eqn=\"prod @7 21600 pixelWidth\"/>"
+            "<v:f eqn=\"prod @7 21600 pixelHeight\"/>"
+            "</v:formulas>"
+            "<v:path o:extrusionok=\"f\" gradientshapeok=\"t\" o:connecttype=\"custom\" "
+            'connectlocs="@5,0;@6,21600;@8,0;@9,21600"/>'
+            "<o:lock v:ext=\"edit\" text=\"t\" shapetype=\"t\"/>"
+            "</v:shapetype>"
+            '<v:shape id="PowerPlusWaterMarkObject" o:spid="_x0000_s1025" type="#_x0000_t136" '
+            'style="position:absolute;margin-left:0;margin-top:0;width:468pt;height:468pt;rotation:315;z-index:-251658240;visibility:visible;mso-wrap-edited:f" '
+            'o:allowincell="f" fillcolor="gray" stroked="f">'
+            '<v:fill opacity="0.1" />'
+            f"<v:textpath style=\"font-family:'Calibri';font-size:48pt\" string=\"{safe_text}\"/>"
+            "</v:shape>"
+            "</w:pict></w:r></w:p>"
+        )
+        header._element.append(parse_xml(watermark_xml))
 
     def _append_seq_field(self, paragraph, label: str, RGBColor, OxmlElement, qn) -> None:
         run = paragraph.add_run()
-        fld_char_begin = OxmlElement('w:fldChar')
-        fld_char_begin.set(qn('w:fldCharType'), 'begin')
+        fld_char_begin = OxmlElement("w:fldChar")
+        fld_char_begin.set(qn("w:fldCharType"), "begin")
         run._r.append(fld_char_begin)
 
-        instr_text = OxmlElement('w:instrText')
-        instr_text.text = f'SEQ {label} \\* ARABIC'
+        instr_text = OxmlElement("w:instrText")
+        instr_text.text = f"SEQ {label} \\* ARABIC"
         run._r.append(instr_text)
 
-        fld_char_separate = OxmlElement('w:fldChar')
-        fld_char_separate.set(qn('w:fldCharType'), 'separate')
+        fld_char_separate = OxmlElement("w:fldChar")
+        fld_char_separate.set(qn("w:fldCharType"), "separate")
         run._r.append(fld_char_separate)
 
-        value_run = paragraph.add_run('1')
-        fld_char_end = OxmlElement('w:fldChar')
-        fld_char_end.set(qn('w:fldCharType'), 'end')
+        value_run = paragraph.add_run("1")
+        fld_char_end = OxmlElement("w:fldChar")
+        fld_char_end.set(qn("w:fldCharType"), "end")
         value_run._r.append(fld_char_end)
 
         for seq_run in (run, value_run):
@@ -2011,17 +2013,3 @@ def run_app() -> None:
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
-# ------------------------------------------------------------------
-if not hasattr(MainWindow, "show_trace_view"):
-    def _fallback_show_trace_view(self) -> None:
-        df = self.data_manager.to_trace_dataframe()
-        if df.empty:
-            QMessageBox.information(self, "Empty", "No data available.")
-            return
-        df = df.copy()
-        df["_row_index"] = range(len(df))
-        self.trace_view.load_data(df)
-        self.view_stack.setCurrentIndex(2)
-        self.log_console("Switched to Traceability Matrix view.")
-
-    MainWindow.show_trace_view = _fallback_show_trace_view
