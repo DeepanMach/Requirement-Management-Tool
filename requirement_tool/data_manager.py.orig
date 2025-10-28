@@ -84,6 +84,7 @@ class RequirementDataManager:
 
     # Add a canonical visible order the UI/grid expects
     DEFAULT_COLUMN_ORDER: ClassVar[List[str]] = [
+        "Section Number",        # self.section_column_name default
         "Object Type",
         "Requirement ID",
         "Object Text",
@@ -561,38 +562,41 @@ class RequirementDataManager:
     # ------------------------------------------------------------------
     def _apply_section_numbering(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Auto-number headings while keeping Object Type clean.
-        Adds numbering prefix (like '1.2 Scope') into Object Text.
-        Supports both explicit numbering already present and automatic numbering.
+        Keep Object Text clean (no numbering).
+        Put numbering ONLY in Object Type as: 'Heading N - <section>'.
+        Auto-detect heading level from leading numbering like '1.', '1.2', '1.2.3' on import.
         """
-        import re
         if df is None or df.empty:
             return df
 
         df = df.copy()
+
+        # Regex: capture a leading section number like "1.", "1.2", "1.2.3" with flexible spaces/dots
         num_re = re.compile(r'^\s*(\d+(?:\s*\.\s*\d+)*)\.?\s+')
 
         def strip_leading_number(s: str) -> tuple[str, str | None]:
             """
             Return (clean_text, section_label or None).
-            Example:
-                '1.2  Scope'  -> ('Scope', '1.2')
-                '  3.  Intro' -> ('Intro', '3')
-                'Text only'   -> ('Text only', None)
+            '1.2  Scope' -> ('Scope', '1.2')
+            '  3.  Intro ' -> ('Intro', '3')
+            'Text only' -> ('Text only', None)
             """
             s = str(s or '')
             m = num_re.match(s)
             if not m:
                 return s.strip(), None
-            label = re.sub(r'\s*\.\s*', '.', m.group(1)).strip('.')  # normalize spaces
+            label = re.sub(r'\s*\.\s*', '.', m.group(1)).strip('.')  # normalize spaces around dots
             rest = s[m.end():].strip()
             return rest, label
 
+        # Per-source counters used when a heading has NO explicit label in text
         current_source = None
         h1 = h2 = h3 = 0
+
         new_obj_types: list[str] = []
         new_obj_texts: list[str] = []
 
+        # We don’t keep a temporary Section Number column anymore
         for _, row in df.iterrows():
             source = row.get("SourceFile", "")
             if source != current_source:
@@ -605,10 +609,11 @@ class RequirementDataManager:
             text = str(row.get("Object Text", "") or "")
             clean_text, explicit_label = strip_leading_number(text)
 
-            # --- Explicit numbering in text (like "1.2 Scope") ---
+            # If there is an explicit label (e.g., 1.2.3), infer level
             if explicit_label:
                 parts = explicit_label.split('.')
-                level = min(len(parts), 3)
+                level = min(len(parts), 3)  # support up to H3 here; extend if you need more
+                # Sync counters to explicit label so subsequent auto-numbering continues correctly
                 try:
                     nums = [int(p) for p in parts]
                 except ValueError:
@@ -624,32 +629,33 @@ class RequirementDataManager:
                 else:
                     h3 = 0
 
-                obj_type_label = f"Heading {level}"     # keep Object Type clean
+                # Force Object Type to be Heading N when an explicit label is present
+                obj_type_label = f"Heading {level} - {explicit_label}"
                 new_obj_types.append(obj_type_label)
-                new_obj_texts.append(f"{explicit_label} {clean_text}".strip())
+                new_obj_texts.append(clean_text)
                 continue
 
-            # --- Auto-numbering case ---
+            # No explicit number in text → decide from existing Object Type
             if raw_type_l == "heading 1":
-                h1 += 1; h2 = h3 = 0
+                h1 += 1; h2 = 0; h3 = 0
                 label = f"{h1}"
-                new_obj_types.append("Heading 1")
-                new_obj_texts.append(f"{label} {clean_text}".strip())
+                new_obj_types.append(f"Heading 1 - {label}")
+                new_obj_texts.append(clean_text)
             elif raw_type_l == "heading 2":
                 if h1 == 0: h1 = 1
                 h2 += 1; h3 = 0
                 label = f"{h1}.{h2}"
-                new_obj_types.append("Heading 2")
-                new_obj_texts.append(f"{label} {clean_text}".strip())
+                new_obj_types.append(f"Heading 2 - {label}")
+                new_obj_texts.append(clean_text)
             elif raw_type_l == "heading 3":
                 if h1 == 0: h1 = 1
                 if h2 == 0: h2 = 1
                 h3 += 1
                 label = f"{h1}.{h2}.{h3}"
-                new_obj_types.append("Heading 3")
-                new_obj_texts.append(f"{label} {clean_text}".strip())
+                new_obj_types.append(f"Heading 3 - {label}")
+                new_obj_texts.append(clean_text)
             else:
-                # Non-heading rows stay the same
+                # Not a heading → leave type as-is; strip any accidental numbering from text
                 new_obj_types.append(raw_type)
                 new_obj_texts.append(clean_text)
 
@@ -661,7 +667,6 @@ class RequirementDataManager:
         df = self._canonicalize_columns(df)
         df = self._reorder_visible_columns(df)
         return df
-
 
 
     # ------------------------------------------------------------------
@@ -1423,15 +1428,6 @@ class RequirementDataManager:
         if current_id and bucket:
             yield current_id, bucket
 
-    def ensure_trace_column(self, direction: str) -> str:
-        """
-        Ensure that the trace column ('Up Trace' or 'Down Trace') exists in the dataframe.
-        """
-        col = "Down Trace" if str(direction).strip().lower().startswith("down") else "Up Trace"
-        if col not in self.dataframe.columns:
-            self.dataframe[col] = ""
-            self.dataframe = self._reorder_visible_columns(self.dataframe)
-        return col
     # ------------------------------------------------------------------
     # --- NEW: build a flattened/exportable dataframe (single row per requirement)
     def build_grouped_export(self) -> pd.DataFrame:

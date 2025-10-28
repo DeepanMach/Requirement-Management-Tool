@@ -59,7 +59,6 @@ from PyQt6.QtWidgets import (
 )
 from Excel_preview_ui import (
     # Map old names to the new helpers
-    ExcelPreviewWidget,
     renumber_headings as renumber_headings_and_requirements,
     renumber_captions as renumber_figures_and_tables,
     is_image_marker,
@@ -89,16 +88,7 @@ from ..data_manager import (
 from .trace_view import TraceMatrixView
 
 from pathlib import Path
-_HEADING_LEVEL_RE = re.compile(r"^heading\s*(\d+)", re.IGNORECASE)
-_HEADING_LABEL_RE = re.compile(r"^heading\s*\d+\s*-\s*([0-9.]+)", re.IGNORECASE)
 
-def _heading_level_from_type(obj_type: str) -> int | None:
-    m = re.search(r"heading\s*(\d+)", str(obj_type or ""), re.IGNORECASE)
-    return int(m.group(1)) if m else None
-
-def _section_label_from_type(obj_type: str) -> str:
-    m = re.search(r"heading\s*\d+\s*-\s*([0-9.]+)", str(obj_type or ""), re.IGNORECASE)
-    return m.group(1).strip() if m else ""
 def canonical_projects_root(file_path: str | Path) -> Path:
     """
     Always return the OUTER `<.../Requirement-Management-Tool>/projects` folder,
@@ -381,34 +371,133 @@ class ExcelTab(QWidget):
     # ------ Loading files into a single DF ------
     def load_files(self, files: list[str]) -> None:
         """
-        Use backend engine to load all Excel data (with image extraction, markdown->table
-        conversion, auto captions, renumbering, and summary popup).
+        Read all sheets from each Excel file, normalize columns, detect markdown tables,
+        then apply renumbering using the updated Excel_preview_ui helpers.
         """
-        try:
-            self.engine.load_from_paths(files)        # does extraction + captions + renumber + popup
-            self.df = self.engine.get_dataframe()
-            self._populate_table()
-        except Exception as e:
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.critical(self, "Load Excel Error", str(e))
+        import pandas as pd
+        from pathlib import Path
 
+        frames = []
+        logs = []
+        for fpath in files or []:
+            try:
+                xls = pd.ExcelFile(fpath, engine="openpyxl")
+            except Exception as e:
+                logs.append(f"❌ Failed to open {Path(fpath).name}: {e}")
+                continue
+
+            for sheet in xls.sheet_names:
+                try:
+                    df = pd.read_excel(fpath, sheet_name=sheet, dtype=str, engine="openpyxl").fillna("")
+                except Exception as e:
+                    logs.append(f"⚠️ Failed reading sheet {sheet} in {Path(fpath).name}: {e}")
+                    continue
+
+                # Ensure base columns exist
+                if "Object Type" not in df.columns:
+                    df.insert(0, "Object Type", "")
+                if "Object Text" not in df.columns:
+                    df.insert(1, "Object Text", "")
+
+                # Convert markdown tables to payload markers so previews render nicely
+                for col in df.columns:
+                    for i in range(len(df)):
+                        cell = str(df.at[i, col])
+                        md = detect_markdown_table(cell)
+                        if md:
+                            rows, cols, data, _has_header = md
+                            df.at[i, col] = save_table_payload(rows, cols, data, name="")
+
+                df["SourceFile"] = Path(fpath).name
+                df["SheetName"]  = sheet
+                frames.append(df)
+
+        if not frames:
+            # Keep empty model if nothing loaded
+            self.df = pd.DataFrame()
+            self._model = QStandardItemModel(0, 0)
+            self.table.setModel(self._model)
+            return
+
+        combined = pd.concat(frames, ignore_index=True).reset_index(drop=True)
+
+        # Apply updated numbering functions (mapped imports)
+        combined = renumber_headings_and_requirements(combined)
+        combined = renumber_figures_and_tables(combined)
+
+        self.df = combined.reset_index(drop=True)
+        self._populate_table()
 
 
     # ------ Build HTML (for MainWindow’s preview) ------
     def build_preview_html(self) -> str:
-        """
-        Delegate to backend for consistent, feature-complete HTML (headings, tables,
-        embedded images, numbered captions). No UI duplication.
-        """
         if self.df is None or self.df.empty:
             return "<div style='font-family:Segoe UI;'>[No data loaded]</div>"
-        try:
-            # Ensure engine renders the exact dataframe currently in the tab
-            self.engine.load_from_dataframe(self.df)
-            return self.engine.generate_preview_html()
-        except Exception:
-            return "<div style='font-family:Segoe UI;'>[Preview unavailable]</div>"
 
+        df = self.df
+        cols = list(df.columns)
+        parts = ['<div style="font-family:Segoe UI, sans-serif;color:#000;">']
+
+        # small helper
+        def heading_level(ot: str) -> int:
+            txt = (ot or "").strip().lower()
+            for k, lvl in {
+                "heading 1":1,"heading1":1,"h1":1,"heading":1,"title":1,
+                "heading 2":2,"heading2":2,"h2":2,
+                "heading 3":3,"heading3":3,"h3":3,
+                "heading 4":4,"heading4":4,"h4":4,
+                "heading 5":5,"heading5":5,"h5":5,
+                "heading 6":6,"heading6":6,"h6":6,
+            }.items():
+                if txt == k:
+                    return lvl
+            return 0
+
+        for _, row in df.iterrows():
+            objtype = str(row.get("Object Type", "")).strip()
+            text = str(row.get("Object Text", "")).strip()
+            lvl = heading_level(objtype)
+            if 1 <= lvl <= 6:
+                tag = {1:'h1',2:'h2',3:'h3',4:'h4',5:'h5',6:'h6'}[lvl]
+                parts.append(f"<{tag} style='margin:6px 0 4px 0;'>{text}</{tag}>")
+                continue
+
+            rendered_any = False
+            for c in cols:
+                val = row.get(c, "")
+                if is_image_marker(val):
+                    meta = parse_image_marker(val)
+                    pth = meta.get("path", "")
+                    if pth and os.path.exists(pth):
+                        with open(pth, "rb") as fh:
+                            b64 = base64.b64encode(fh.read()).decode("ascii")
+                        parts.append(f"<div style='text-align:center;margin:8px;'><img src='data:image/png;base64,{b64}' style='max-width:80%;height:auto;border:0;'></div>")
+                    else:
+                        parts.append(f"<p style='color:#a00'>[Missing Image: {os.path.basename(pth)}]</p>")
+                    rendered_any = True
+                elif is_table_marker(val):
+                    r, cnum, data, name = load_table_payload(val)
+                    html = ["<table border='1' cellspacing='0' cellpadding='6' style='border-collapse:collapse;margin:8px auto;'>"]
+                    for i in range(max(1, r)):
+                        html.append("<tr>")
+                        for j in range(max(1, cnum)):
+                            try:
+                                cell = str(data[i][j])
+                            except Exception:
+                                cell = ""
+                            tag2 = "th" if i == 0 and any(data[0]) else "td"
+                            style = "font-weight:bold;" if tag2 == "th" else ""
+                            html.append(f"<{tag2} style='{style}'>{cell}</{tag2}>")
+                        html.append("</tr>")
+                    html.append("</table>")
+                    parts.append("".join(html))
+                    rendered_any = True
+
+            if not rendered_any and text:
+                parts.append(f"<div>{self._text_to_html_blocks(text)}</div>")
+
+        parts.append("</div>")
+        return "".join(parts)
 
     # ------ Internal: populate table view from self.df ------
     def _populate_table(self):
@@ -712,8 +801,6 @@ class MainWindow(QMainWindow):
         self.save_btn.clicked.connect(self.save_word)
         self.trace_btn = QPushButton('Traceability Matrix')
         self.trace_btn.clicked.connect(self.show_trace_view)
-        self.add_trace_btn = QPushButton("Add Trace Column")
-        self.add_trace_btn.clicked.connect(self.add_trace_column)
         self.save_excel_btn = QPushButton('Save Excel')
         self.save_excel_btn.clicked.connect(self.save_excel_with_images)
 
@@ -747,7 +834,6 @@ class MainWindow(QMainWindow):
             self.back_btn,
             self.save_btn,
             self.trace_btn,
-            self.add_trace_btn,
             self.save_excel_btn,
         ):
             button_row.addWidget(button)
@@ -775,9 +861,6 @@ class MainWindow(QMainWindow):
 
         center_row = QHBoxLayout()
         main_layout.addLayout(center_row)
-
-        self.excel_engine = ExcelPreviewWidget()
-        self.excel_engine.dataChanged.connect(self._on_engine_data_changed)
 
         # ---------------- Left Panel: Navigation + Search Results ----------------
         left_panel = QVBoxLayout()
@@ -949,17 +1032,6 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self._wire_tooltips()
-
-    def _on_engine_data_changed(self, df):
-        # Refresh whichever tab is showing the table
-        tab = getattr(self, "table_tabs", None)
-        if tab:
-            w = tab.currentWidget()
-            if w and hasattr(w, "df"):
-                w.df = df
-                if hasattr(w, "_populate_table"):
-                    w._populate_table()
-
 
     # ------------------------------------------------------------------
     def _show_table_context_menu(self, table: QTableWidget, pos: QPoint) -> None:
@@ -1207,18 +1279,7 @@ class MainWindow(QMainWindow):
             return pd.DataFrame()
         key = source or self._current_source_name()
         if key in self._tab_indices:
-            if raw:
-                # Ignore per-tab filters/sorts and return the whole group
-                if key == "Excel":
-                    if "SourceType" in df.columns:
-                        mask = df["SourceType"].astype(str).str.lower().eq("excel")
-                        return df[mask].copy()
-                else:
-                    if "SourceFile" in df.columns:
-                        mask = df["SourceFile"].astype(str).str.strip().eq(key)
-                        return df[mask].copy()
             indices = self._tab_indices.get(key, [])
-            return df.loc[indices].reset_index(drop=True).copy() if indices else pd.DataFrame()
             if indices:
                 subset = df.loc[indices]
                 return subset if raw else subset.reset_index(drop=True).copy()
@@ -2081,43 +2142,20 @@ class MainWindow(QMainWindow):
         return container
 
     # ------------------------------------------------------------------
-
-    def _heading_level_from_type(obj_type: str) -> int | None:
-        m = re.search(r"heading\s*(\d+)", str(obj_type or ""), re.IGNORECASE)
-        return int(m.group(1)) if m else None
-
-    def _section_label_from_type(obj_type: str) -> str:
-        m = re.search(r"heading\s*\d+\s*-\s*([0-9.]+)", str(obj_type or ""), re.IGNORECASE)
-        return m.group(1).strip() if m else ""
-
     def populate_navigation(self) -> None:
-        """
-        Build the left-side navigation tree based on heading levels.
-        Handles missing 'Section Number' column, and Object Type formats like 'Heading 1 - 10.1'.
-        """
         self.nav_tree.clear()
         subset = self._get_dataframe_for_source(raw=True)
         if subset.empty:
             return
-
         current_h1: QTreeWidgetItem | None = None
         current_h2: QTreeWidgetItem | None = None
-
-        section_col = getattr(self.data_manager, "section_column_name", "Section Number")
-
         for global_index, row in subset.iterrows():
-            obj_type = str(row.get("Object Type", "")).strip()
-            lvl = _heading_level_from_type(obj_type)
-            if not lvl:
-                continue  # Skip non-heading rows
-
-            # --- Safe section + text extraction ---
-            section = str(row.get(section_col, "") or "").strip() or _section_label_from_type(obj_type)
-            text = str(row.get("Object Text", "") or "").strip()
-            if not text and not section:
+            obj_type = str(row.get("Object Type", "")).strip().lower()
+            section = str(row.get(self.data_manager.section_column_name, "")).strip()
+            text = str(row.get("Object Text", "")).strip()
+            if not text:
                 continue
-
-            label = f"{section} {text}".strip() if section else text
+            label = f"{section} {text}".strip()
             payload = {
                 "index": int(global_index),
                 "section": section,
@@ -2125,34 +2163,24 @@ class MainWindow(QMainWindow):
                 "type": obj_type,
                 "anchor": f"row-{global_index}",
             }
-            # --- Build tree based on level ---
-            if lvl == 1:
+            if obj_type == "heading 1":
                 current_h1 = QTreeWidgetItem([label])
                 current_h1.setData(0, Qt.ItemDataRole.UserRole, payload)
                 self.nav_tree.addTopLevelItem(current_h1)
                 current_h2 = None
-
-            elif lvl == 2:
+            elif obj_type == "heading 2":
                 if current_h1 is None:
-                    current_h1 = QTreeWidgetItem(["(Untitled Section)"])
-                    self.nav_tree.addTopLevelItem(current_h1)
+                    continue
                 current_h2 = QTreeWidgetItem([label])
                 current_h2.setData(0, Qt.ItemDataRole.UserRole, payload)
                 current_h1.addChild(current_h2)
-
-            elif lvl == 3:
+            elif obj_type == "heading 3":
                 if current_h2 is None:
-                    if current_h1 is None:
-                        current_h1 = QTreeWidgetItem(["(Untitled Section)"])
-                        self.nav_tree.addTopLevelItem(current_h1)
-                    current_h2 = QTreeWidgetItem(["(Subsection)"])
-                    current_h1.addChild(current_h2)
+                    continue
                 item = QTreeWidgetItem([label])
                 item.setData(0, Qt.ItemDataRole.UserRole, payload)
                 current_h2.addChild(item)
-
         self.nav_tree.expandAll()
-
 
     # ------------------------------------------------------------------
     def on_nav_item_clicked(self, item: QTreeWidgetItem) -> None:
@@ -2404,18 +2432,6 @@ class MainWindow(QMainWindow):
             self.word_preview.setHtml(self.compose_preview_html(df))
 
     # ------------------------------------------------------------------
-    import re, html, json
-    import pandas as pd
-    from typing import Optional
-
-    def _heading_level_from_type(obj_type: str) -> int | None:
-        m = re.search(r"heading\s*(\d+)", str(obj_type or ""), re.IGNORECASE)
-        return int(m.group(1)) if m else None
-
-    def _section_label_from_type(obj_type: str) -> str:
-        m = re.search(r"heading\s*\d+\s*-\s*([0-9.]+)", str(obj_type or ""), re.IGNORECASE)
-        return m.group(1).strip() if m else ""
-
     def compose_preview_html(self, df: Optional[pd.DataFrame] = None) -> str:
         df_raw = df.copy() if df is not None else self._get_dataframe_for_source(raw=True)
         if df_raw.empty:
@@ -2467,50 +2483,48 @@ class MainWindow(QMainWindow):
         if local_df.empty:
             return f"<html><head>{styles}</head><body>{front_page_html}<p>No data loaded.</p></body></html>"
 
-        toc_entries, figure_entries, table_entries = [], [], []
+        toc_entries = []
+        figure_entries = []
+        table_entries = []
         body_parts: list[str] = []
-        figure_count = table_count = 0
-        section_col = getattr(self.data_manager, "section_column_name", "Section Number")
+        figure_count = 0
+        table_count = 0
+        section_col = self.data_manager.section_column_name
 
         for idx, row in local_df.iterrows():
             global_idx = row.get("_global_index", idx)
-            obj_type = str(row.get("Object Type", "")).strip()
-            lower_type = obj_type.lower()
-            text = str(row.get("Object Text", "") or "").strip()
-            req_id = str(row.get("Requirement ID", "") or "").strip()
-            attachment_type = str(row.get("Attachment Type", "") or "").strip().lower()
-            attachment_data = str(row.get("Attachment Data", "") or "").strip()
+            obj_type = str(row.get("Object Type", "")).strip().lower()
+            section = str(row.get(section_col, "")).strip()
+            text = str(row.get("Object Text", "")).strip()
+            req_id = str(row.get("Requirement ID", "")).strip()
+            attachment_type = str(row.get("Attachment Type", "")).strip().lower()
+            attachment_data = str(row.get("Attachment Data", "")).strip()
 
-            # --- Robust section extraction ---
-            section = str(row.get(section_col, "") or "").strip()
-            if not section:
-                section = _section_label_from_type(obj_type)
-            if not section:
-                m = re.match(r"^\s*(\d+(?:\.\d+)*)\s+", text)
-                section = m.group(1) if m else ""
-            heading_text = (f"{section} {text}".strip() if section else text or "Heading")
-            # ----------------------------------
-
-            # --- Headings ---
-            if lower_type.startswith("heading"):
-                level = _heading_level_from_type(obj_type) or 1
-                level = max(1, min(level, 9))
+            if obj_type.startswith("heading"):
+                level = int(obj_type.split()[-1])
+                heading_text = f"{section} {text}".strip() or text or section or "Heading"
                 heading_id = f"row-{global_idx}"
-                body_parts.append(f'<h{level} id="{heading_id}">{html.escape(heading_text)}</h{level}>')
-                toc_entries.append({"level": level, "id": heading_id, "title": heading_text})
+                body_parts.append(
+                    f'<h{level} id="{heading_id}">{html.escape(heading_text)}</h{level}>'
+                )
+                toc_entries.append(
+                    {"level": level, "id": heading_id, "title": heading_text}
+                )
                 continue
 
-            # --- Tables ---
             if attachment_type == "table" and attachment_data:
                 table_count += 1
                 table_id = f"table-{global_idx}"
                 caption_text = text or f"Table {table_count}"
                 body_parts.append(f'<div id="{table_id}" class="table-block">{attachment_data}')
-                body_parts.append(f'<div class="caption">Table {table_count}: {html.escape(caption_text)}</div></div>')
-                table_entries.append({"id": table_id, "title": f"Table {table_count}: {caption_text}"})
+                body_parts.append(
+                    f'<div class="caption">Table {table_count}: {html.escape(caption_text)}</div></div>'
+                )
+                table_entries.append(
+                    {"id": table_id, "title": f"Table {table_count}: {caption_text}"}
+                )
                 continue
 
-            # --- Images ---
             if attachment_type == "image" and attachment_data:
                 figure_count += 1
                 figure_id = f"figure-{global_idx}"
@@ -2528,65 +2542,38 @@ class MainWindow(QMainWindow):
                     f'<div id="{figure_id}" class="image-block"><img src="data:{mime};base64,{image_data}" '
                     f'alt="{html.escape(caption_text)}" style="max-width:{width_percent}%; width:{width_percent}%; height:auto;"/></div>'
                 )
-                body_parts.append(f'<div class="caption">Figure {figure_count}: {html.escape(caption_text)}</div>')
-                figure_entries.append({"id": figure_id, "title": f"Figure {figure_count}: {caption_text}"})
+                body_parts.append(
+                    f'<div class="caption">Figure {figure_count}: {html.escape(caption_text)}</div>'
+                )
+                figure_entries.append(
+                    {"id": figure_id, "title": f"Figure {figure_count}: {caption_text}"}
+                )
                 continue
 
-            # --- Requirements ---
             anchor_id = f"row-{global_idx}"
             if req_id:
-                # Build safe HTML anchor for this requirement ID
-                rid = str(req_id).strip()
-                rid_anchor = re.sub(r'[^A-Za-z0-9_.-]+', '-', rid)  # normalize ID for HTML anchor
-                anchor_id = f"rid-{rid_anchor}"
-
-                # --- Make Up/Down Trace text clickable ---
-                def make_trace_links(trace_text: str) -> str:
-                    tokens = re.split(r"[,;\\s]+", trace_text.strip())
-                    linked = []
-                    for t in tokens:
-                        t = t.strip()
-                        if not t:
-                            continue
-                        safe_id = re.sub(r'[^A-Za-z0-9_.-]+', '-', t)
-                        linked.append(f'<a href="#rid-{safe_id}">{html.escape(t)}</a>')
-                    return ", ".join(linked)
-
-                up_trace = str(row.get("Up Trace", "") or "").strip()
-                down_trace = str(row.get("Down Trace", "") or "").strip()
-                up_html = make_trace_links(up_trace) if up_trace else ""
-                down_html = make_trace_links(down_trace) if down_trace else ""
-
-                # --- Build requirement block ---
                 requirement_text = html.escape(text) if text else "&nbsp;"
                 body_parts.append(
                     f'<div id="{anchor_id}" class="requirement-block">'
-                    f'<h4><a href="#{anchor_id}">{html.escape(rid)}</a></h4>'
+                    f'<p class="requirement-id">Requirement ID: {html.escape(req_id)}</p>'
                     f'<p class="requirement-text">{requirement_text}</p>'
+                    "</div>"
                 )
-                if up_html or down_html:
-                    body_parts.append("<p>")
-                    if up_html:
-                        body_parts.append(f"<b>Up Trace:</b> {up_html}<br/>")
-                    if down_html:
-                        body_parts.append(f"<b>Down Trace:</b> {down_html}")
-                    body_parts.append("</p>")
-                body_parts.append("</div>")
                 continue
 
-
-            # --- Normal body text ---
             if text:
-                body_parts.append(f'<p id="{anchor_id}" class="body-text">{html.escape(text)}</p>')
+                body_parts.append(
+                    f'<p id="{anchor_id}" class="body-text">{html.escape(text)}</p>'
+                )
 
-        # --- TOC / Lists ---
         toc_html = ""
         if toc_entries:
             toc_html = '<div class="toc-section"><h2>Table of Contents</h2>'
             for entry in toc_entries:
                 toc_html += (
                     f'<div class="toc-item level-{entry["level"]}">'
-                    f'<a href="#{entry["id"]}">{html.escape(entry["title"])}</a></div>'
+                    f'<a href="#{entry["id"]}">{html.escape(entry["title"])}</a>'
+                    "</div>"
                 )
             toc_html += "</div>"
 
@@ -2855,48 +2842,37 @@ class MainWindow(QMainWindow):
     # >>> REPLACE MainWindow.run_convert_preview
     def run_convert_preview(self):
         """
-        When user clicks 'Run (Convert to Word)', build the right-hand HTML preview
-        from the active Excel tab's DataFrame. Also updates the navigation tree.
+        When user clicks 'Run (Convert to Word)', use the DataFrame
+        from the active Excel tab to generate the right-hand preview
+        (and continue whatever conversion/export pipeline you already have).
         """
-        try:
-            tab = self._active_excel_tab()
-            if not tab or tab.df is None or tab.df.empty:
-                # Preserve old behavior if present, else show a user-facing note
-                try:
-                    super().run_convert_preview()
-                except Exception:
-                    if hasattr(self, "log_console"):
-                        self.log_console("No Excel tab selected or tab is empty.")
-                return
-
-            # Use the tab's dataframe (already finalized by the data manager)
-            df = tab.df.copy()
-
-            # Compose the HTML using the safer heading parsing (see helpers above)
-            html = self.compose_word_preview_html(df)
-
-            # Push to the preview widget
-            if hasattr(self, "word_preview") and self.word_preview is not None:
-                self.word_preview.setHtml(html)
-            elif hasattr(self, "preview") and self.preview is not None:
-                self.preview.setHtml(html)
-
-            # Rebuild Navigation based on the same df
+        tab = self._active_excel_tab()
+        if not tab or tab.df is None or tab.df.empty:
+            # Fallback to your previous behavior if no Excel tab selected
+            # (If you want to disable fallback, just show a warning instead.)
             try:
-                self.populate_navigation(df)
-            except Exception as nav_exc:
-                # Navigation failures should not block the preview
+                super().run_convert_preview()  # if old impl exists and is still desired
+            except Exception:
+                # Or inform the user:
                 if hasattr(self, "log_console"):
-                    self.log_console(f"Navigation build warning: {nav_exc}")
+                    self.log_console("No Excel tab selected or tab is empty.")
+            return
 
-            if hasattr(self, "log_console"):
-                self.log_console("Word preview generated.")
+        # Build HTML from the tab’s DF and show in your existing preview widget
+        html = tab.build_preview_html()
 
-        except Exception as exc:
-            if hasattr(self, "log_console"):
-                self.log_console(f"Error generating Word preview: {exc}")
+        # If your main window has a QTextBrowser/QTextEdit preview area, set it here.
+        # Common names I've seen in your code: self.word_preview / self.preview
+        if hasattr(self, "word_preview") and self.word_preview is not None:
+            self.word_preview.setHtml(html)
+            # If you maintain anchors/navigation, do that here as well.
+        elif hasattr(self, "preview") and self.preview is not None:
+            self.preview.setHtml(html)
 
-
+        # If you also export DOCX here, call your existing converter function with tab.df
+        # Example:
+        # self._export_df_to_docx(tab.df)
+        # (Keep your original export/save flow unchanged; just feed it the DF from the tab.)
 
 
     # ------------------------------------------------------------------
@@ -3358,28 +3334,6 @@ class MainWindow(QMainWindow):
         lot_field.set(qn("w:instr"), 'TOC \\h \\z \\c "Table"')
         lot_para._p.append(lot_field)
 
-    def add_trace_column(self):
-        """
-        Adds an 'Up Trace' or 'Down Trace' column dynamically when the user requests tracing.
-        """
-        from PyQt5.QtWidgets import QInputDialog
-
-        direction, ok = QInputDialog.getItem(
-            self,
-            "Add Trace Column",
-            "Select trace direction:",
-            ["Up", "Down"],
-            0,
-            False,
-        )
-        if not ok:
-            return
-
-        col = self.data_manager.ensure_trace_column(direction)
-        self._refresh_table_view()
-        if hasattr(self, "log_console"):
-            self.log_console(f"Trace column '{col}' added to table.")
-
     # ------------------------------------------------------------------
     def _append_body_content(
         self,
@@ -3419,8 +3373,7 @@ class MainWindow(QMainWindow):
                     maybe_add_horizontal_rule()
                     pending_requirement_rule = False
                 try:
-                    level = _heading_level_from_type(obj_type) or 1
-                    level = max(1, min(level, 9))
+                    level = max(1, min(int(obj_type.split()[-1]), 9))
                 except ValueError:
                     level = 1
                 heading_text = f"{section} {text_value}".strip() or text_value or section or "Heading"
@@ -4391,7 +4344,7 @@ class MainWindow(QMainWindow):
         """Create a new tab for the selected/dropped Excel files and load them."""
         if not files:
             return
-        tab = ExcelTab(self, engine=self.excel_engine)
+        tab = ExcelTab(self)
         tab.load_files(files)
         # Name the tab with file base names (trim if too long)
         base = ", ".join([os.path.basename(f) for f in files])

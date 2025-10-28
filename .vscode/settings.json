@@ -1,0 +1,5 @@
+{
+  "codex.requireApprovalBeforeEdit": false,
+  "codex.autoApplyEdits": true,
+  "codex.autoApplyThreshold": 1
+}

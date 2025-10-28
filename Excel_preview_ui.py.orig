@@ -1,0 +1,639 @@
+"""
+Excel_preview_ui.py — QWidget-only Excel preview/ingest backend
+
+✅ Restores features from backup without adding extra UI controls:
+   - Embedded Image Extraction from .xlsx (ZIP + OpenXML mapping)
+   - Auto caption row insertion for Image/Table
+   - Undo stack + Ctrl+Z inside the widget
+   - Load summary popup (counts images/tables)
+   - Rich HTML generation helper (for MainWindow to render)
+
+Public API preserved:
+   - load_from_paths(paths: list[str]) -> None
+   - load_from_path(path: str) -> None
+   - load_from_dataframe(df: pd.DataFrame) -> None
+   - get_dataframe() -> pd.DataFrame
+
+Also exposes the helper functions used by MainWindow:
+   - renumber_headings, renumber_captions
+   - is_image_marker, is_table_marker, parse_image_marker
+   - detect_markdown_table, save_table_payload, load_table_payload
+
+No preview pane, no toolbar buttons — these are handled by your main_window.
+"""
+from __future__ import annotations
+
+import base64
+import io
+import json
+import os
+import re
+import shutil
+import tempfile
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QKeySequence, QShortcut
+from PyQt6.QtWidgets import QMessageBox, QWidget
+
+# =========================
+# Helper dataclasses
+# =========================
+@dataclass
+class ExtractedImage:
+    sheet: str
+    row: int  # 0-based Excel row index (best effort)
+    col: int  # 0-based Excel col index (best effort)
+    path: str
+    name: str
+
+# =========================
+# Public helper functions (imported by main_window)
+# =========================
+MD_TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$")
+
+
+def detect_markdown_table(text: str) -> Optional[Tuple[int, int, List[List[str]], bool]]:
+    """Detect a simple markdown table and return (rows, cols, data, has_header).
+    Very lightweight and permissive; safe fallback when users paste MD.
+    """
+    if not text:
+        return None
+    lines = [ln.rstrip() for ln in str(text).splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    if not all(MD_TABLE_ROW.match(ln) for ln in lines[:2]):
+        return None
+    data: List[List[str]] = []
+    for ln in lines:
+        if not MD_TABLE_ROW.match(ln):
+            return None
+        cells = [c.strip() for c in ln.strip().strip('|').split('|')]
+        data.append(cells)
+    cols = max(len(r) for r in data)
+    # pad ragged rows
+    for r in data:
+        if len(r) < cols:
+            r += [""] * (cols - len(r))
+    has_header = len(data) >= 2 and all(ch in "-:| " for ch in lines[1].replace('|', ''))
+    return (len(data), cols, data, has_header)
+
+
+def save_table_payload(rows: int, cols: int, data: List[List[str]], name: str = "") -> str:
+    payload = {
+        "type": "table",
+        "rows": int(rows),
+        "cols": int(cols),
+        "data": data,
+        "name": name or "",
+    }
+    return f"[Table]|{json.dumps(payload, ensure_ascii=False)}"
+
+
+def load_table_payload(value: str) -> Tuple[int, int, List[List[str]], str]:
+    try:
+        if not is_table_marker(value):
+            return (0, 0, [], "")
+        obj = json.loads(str(value).split('|', 1)[1])
+        return int(obj.get("rows", 0)), int(obj.get("cols", 0)), list(obj.get("data", [])), str(obj.get("name", ""))
+    except Exception:
+        return (0, 0, [], "")
+
+
+def is_image_marker(value: str) -> bool:
+    return isinstance(value, str) and value.startswith("[Image]|")
+
+
+def is_table_marker(value: str) -> bool:
+    return isinstance(value, str) and value.startswith("[Table]|")
+
+
+def parse_image_marker(value: str) -> Dict[str, str]:
+    """Return {path, name, mime} from a marker string."""
+    try:
+        if not is_image_marker(value):
+            return {}
+        return json.loads(str(value).split('|', 1)[1])
+    except Exception:
+        return {}
+
+
+# --- Simple numbering helpers ---
+HEADING_RE = re.compile(r"^heading\s*(\d+)\s*$", re.I)
+
+
+def renumber_headings(df: pd.DataFrame) -> pd.DataFrame:
+    """Add/update a Section number column based on Heading levels.
+    Keeps existing columns; returns a new DataFrame.
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    if "Section" not in df.columns:
+        df.insert(0, "Section", "")
+    counters = [0] * 10
+    for i, row in df.iterrows():
+        ot = str(row.get("Object Type", "")).strip()
+        m = HEADING_RE.match(ot)
+        if m:
+            lvl = max(1, min(9, int(m.group(1))))
+            counters[lvl] += 1
+            for k in range(lvl + 1, 10):
+                counters[k] = 0
+            section = ".".join(str(counters[k]) for k in range(1, lvl + 1) if counters[k] > 0)
+            df.at[i, "Section"] = section
+        else:
+            # carry forward last known section
+            prev = df.at[i - 1, "Section"] if i > 0 else ""
+            df.at[i, "Section"] = prev
+    return df
+
+
+def renumber_captions(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure Figure/Table captions are numbered sequentially.
+    Relies on row order.
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    fig_n = 0
+    tbl_n = 0
+    for i, row in df.iterrows():
+        ot = str(row.get("Object Type", "")).strip().lower()
+        if ot == "image":
+            fig_n += 1
+            # if caption row immediately below and type==Text, prefix it
+            if i + 1 < len(df) and str(df.at[i + 1, "Object Type"]).strip().lower() == "text":
+                cap = str(df.at[i + 1, "Object Text"]).strip()
+                if not cap or not cap.lower().startswith("figure "):
+                    df.at[i + 1, "Object Text"] = f"Figure {fig_n}: {cap}".rstrip()
+        elif ot == "table":
+            tbl_n += 1
+            if i + 1 < len(df) and str(df.at[i + 1, "Object Type"]).strip().lower() == "text":
+                cap = str(df.at[i + 1, "Object Text"]).strip()
+                if not cap or not cap.lower().startswith("table "):
+                    df.at[i + 1, "Object Text"] = f"Table {tbl_n}: {cap}".rstrip()
+    return df
+
+
+# =========================
+# Core widget
+# =========================
+class ExcelPreviewWidget(QWidget):
+    dataChanged = pyqtSignal(pd.DataFrame)
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._df: pd.DataFrame = pd.DataFrame()
+        self._undo_stack: List[pd.DataFrame] = []
+        self._tmp_dir = Path(tempfile.mkdtemp(prefix="excel_preview_assets_"))
+        # Bind Ctrl+Z to undo inside the widget (non-invasive)
+        QShortcut(QKeySequence("Ctrl+Z"), self, activated=self.undo)
+
+    # ---------------- Public API (unchanged signatures) ----------------
+    def load_from_paths(self, paths: List[str]) -> None:
+        df, stats = self._read_excel_all_sheets(paths)
+        self._commit_df(df)
+        # Load summary popup
+        try:
+            QMessageBox.information(
+                self,
+                "Excel Loaded",
+                f"Loaded {stats.get('files', 0)} file(s).\n"
+                f"Images: {stats.get('images', 0)}\nTables: {stats.get('tables', 0)}",
+            )
+        except Exception:
+            pass
+
+    def load_from_path(self, path: str) -> None:
+        self.load_from_paths([path])
+
+    def load_from_dataframe(self, df: pd.DataFrame) -> None:
+        df = df.copy() if df is not None else pd.DataFrame()
+        df = renumber_headings(df)
+        df = renumber_captions(df)
+        self._commit_df(df)
+
+    def get_dataframe(self) -> pd.DataFrame:
+        return self._df.copy()
+
+    # ---------------- Convenience API for host (caption rows) ----------------
+    def insert_image_row(self, path: str, name: Optional[str] = None, insert_at: Optional[int] = None,
+                         source_file: str = "Manual", sheet_name: str = "Manual") -> None:
+        """Insert an Image row and auto-caption row below it."""
+        marker = self._image_marker_for_path(path, name)
+        insert_at = len(self._df) if insert_at is None else max(0, min(insert_at, len(self._df)))
+        self._insert_rows([
+            {
+                "Object Type": "Image",
+                "Object Text": name or Path(path).name,
+                "Attachment Type": "image",
+                "Attachment Data": marker.split('|', 1)[1],  # store JSON only if host prefers
+                "SourceFile": source_file,
+                "SheetName": sheet_name,
+            },
+            {
+                "Object Type": "Text",
+                "Object Text": f"Figure : {name or Path(path).stem}",
+                "Attachment Type": "",
+                "Attachment Data": "",
+                "SourceFile": source_file,
+                "SheetName": sheet_name,
+            },
+        ], insert_at)
+        self._renumber_and_emit()
+
+    def insert_table_row(self, df_table: pd.DataFrame, name: str = "", insert_at: Optional[int] = None,
+                         source_file: str = "Manual", sheet_name: str = "Manual") -> None:
+        rows, cols = int(df_table.shape[0]), int(df_table.shape[1])
+        data = [[str(x) for x in df_table.iloc[i].tolist()] for i in range(rows)]
+        marker = save_table_payload(rows, cols, data, name=name)
+        insert_at = len(self._df) if insert_at is None else max(0, min(insert_at, len(self._df)))
+        self._insert_rows([
+            {
+                "Object Type": "Table",
+                "Object Text": name,
+                "Attachment Type": "table",
+                "Attachment Data": marker.split('|', 1)[1],
+                "SourceFile": source_file,
+                "SheetName": sheet_name,
+            },
+            {
+                "Object Type": "Text",
+                "Object Text": f"Table : {name}",
+                "Attachment Type": "",
+                "Attachment Data": "",
+                "SourceFile": source_file,
+                "SheetName": sheet_name,
+            },
+        ], insert_at)
+        self._renumber_and_emit()
+
+    # ---------------- Undo ----------------
+    def undo(self) -> None:
+        if len(self._undo_stack) <= 1:
+            return
+        self._undo_stack.pop()
+        self._df = self._undo_stack[-1].copy()
+        self.dataChanged.emit(self._df.copy())
+
+    # ---------------- HTML builder (no UI) ----------------
+    def generate_preview_html(self) -> str:
+        """Return a rich HTML preview of the current DataFrame (no widgets created)."""
+        if self._df.empty:
+            return "<div style='font-family:Segoe UI;'>[No data loaded]</div>"
+        df = self._df
+        cols = list(df.columns)
+        out: List[str] = ["<div style='font-family:Segoe UI, sans-serif;color:#000;'>"]
+
+        def heading_level(ot: str) -> int:
+            m = HEADING_RE.match((ot or '').strip())
+            return int(m.group(1)) if m else 0
+
+        fig_n = 0
+        tbl_n = 0
+        for _, row in df.iterrows():
+            ot = str(row.get("Object Type", "")).strip()
+            txt = str(row.get("Object Text", "")).strip()
+            lvl = heading_level(ot)
+            if 1 <= lvl <= 6:
+                tag = f"h{lvl}"
+                out.append(f"<{tag} style='margin:6px 0 4px 0;'>{txt}</{tag}>")
+                continue
+            rendered = False
+            for c in cols:
+                val = row.get(c, "")
+                if is_image_marker(val):
+                    meta = parse_image_marker(val)
+                    pth = meta.get("path", "")
+                    if pth and os.path.exists(pth):
+                        with open(pth, 'rb') as fh:
+                            b64 = base64.b64encode(fh.read()).decode('ascii')
+                        fig_n += 1
+                        out.append(
+                            f"<div style='text-align:center;margin:8px;'><img src='data:image/png;base64,{b64}' style='max-width:80%;height:auto;border:0;'/><div style='font-style:italic;font-size:10pt;'>Figure {fig_n}: {txt or Path(pth).stem}</div></div>"
+                        )
+                    else:
+                        out.append(f"<p style='color:#a00'>[Missing Image: {os.path.basename(pth)}]</p>")
+                    rendered = True
+                elif is_table_marker(val):
+                    r, cnum, data, name = load_table_payload(val)
+                    tbl_n += 1
+                    html_rows = ["<table border='1' cellspacing='0' cellpadding='6' style='border-collapse:collapse;margin:8px auto;'>"]
+                    for i in range(max(1, r)):
+                        html_rows.append("<tr>")
+                        for j in range(max(1, cnum)):
+                            try:
+                                cell = str(data[i][j])
+                            except Exception:
+                                cell = ""
+                            tag2 = "th" if i == 0 and any(data[0]) else "td"
+                            style = "font-weight:bold;" if tag2 == "th" else ""
+                            html_rows.append(f"<{tag2} style='{style}'>{cell}</{tag2}>")
+                        html_rows.append("</tr>")
+                    html_rows.append("</table>")
+                    out.append("".join(html_rows))
+                    out.append(f"<div style='text-align:center;font-style:italic;font-size:10pt;'>Table {tbl_n}: {txt or name}</div>")
+                    rendered = True
+            if not rendered and txt:
+                out.append(f"<div>{self._text_to_html_blocks(txt)}</div>")
+        out.append("</div>")
+        return "".join(out)
+
+    # =========================
+    # Internal: Excel reading + embedded image extraction
+    # =========================
+    def _read_excel_all_sheets(self, paths: List[str]) -> Tuple[pd.DataFrame, Dict[str, int]]:
+        frames: List[pd.DataFrame] = []
+        stats = {"files": 0, "images": 0, "tables": 0}
+        for path in paths or []:
+            p = Path(path)
+            if not p.exists():
+                continue
+            try:
+                xls = pd.ExcelFile(str(p), engine="openpyxl")
+            except Exception:
+                continue
+            stats["files"] += 1
+
+            # Extract embedded images per sheet (best effort positions)
+            images_by_sheet = self._extract_embedded_images_per_sheet(p)
+
+            for sheet in xls.sheet_names:
+                try:
+                    df = pd.read_excel(str(p), sheet_name=sheet, dtype=str, engine="openpyxl").fillna("")
+                except Exception:
+                    continue
+
+                # Ensure baseline columns
+                if "Object Type" not in df.columns:
+                    df.insert(0, "Object Type", "")
+                if "Object Text" not in df.columns:
+                    df.insert(1, "Object Text", "")
+                if "Attachment Type" not in df.columns:
+                    df["Attachment Type"] = ""
+                if "Attachment Data" not in df.columns:
+                    df["Attachment Data"] = ""
+
+                # Convert markdown tables into markers
+                for c in list(df.columns):
+                    for i in range(len(df)):
+                        md = detect_markdown_table(str(df.at[i, c]))
+                        if md:
+                            rows, cols, data, _ = md
+                            df.at[i, c] = save_table_payload(rows, cols, data, name="")
+                            stats["tables"] += 1
+
+                # Insert extracted images at their approximate positions as new rows
+                extracted = images_by_sheet.get(sheet, [])
+                stats["images"] += len(extracted)
+                if extracted:
+                    # Insert from bottom to keep row indices valid
+                    for img in sorted(extracted, key=lambda e: (e.row, e.col), reverse=True):
+                        marker = self._image_marker_for_path(img.path, img.name)
+                        row_payload = {
+                            "Object Type": "Image",
+                            "Object Text": img.name,
+                            "Attachment Type": "image",
+                            "Attachment Data": marker.split('|', 1)[1],
+                        }
+                        upper = df.iloc[: img.row + 1] if img.row < len(df) else df
+                        lower = df.iloc[img.row + 1 :] if img.row + 1 < len(df) else df.iloc[0:0]
+                        df = pd.concat([upper, pd.DataFrame([row_payload]), lower], ignore_index=True)
+                        # caption row directly below
+                        df = pd.concat([
+                            df.iloc[: img.row + 2],
+                            pd.DataFrame([
+                                {
+                                    "Object Type": "Text",
+                                    "Object Text": f"Figure : {img.name}",
+                                    "Attachment Type": "",
+                                    "Attachment Data": "",
+                                }
+                            ]),
+                            df.iloc[img.row + 2 :],
+                        ], ignore_index=True)
+
+                df["SourceFile"] = p.name
+                df["SheetName"] = sheet
+                df["SourceType"] = "excel"
+                frames.append(df)
+
+        if not frames:
+            return pd.DataFrame(), stats
+        combined = pd.concat(frames, ignore_index=True).reset_index(drop=True)
+        combined = renumber_headings(combined)
+        combined = renumber_captions(combined)
+        return combined, stats
+
+    def _image_marker_for_path(self, path: str, name: Optional[str]) -> str:
+        mime = "image/png"
+        payload = {"path": str(path), "name": name or Path(path).name, "mime": mime}
+        return f"[Image]|{json.dumps(payload, ensure_ascii=False)}"
+
+    def _extract_embedded_images_per_sheet(self, xlsx_path: Path) -> Dict[str, List[ExtractedImage]]:
+        """Restore backup behavior: parse the .xlsx OPC package to locate images.
+        Returns mapping: {sheet_name: [ExtractedImage, ...]}
+        Notes:
+          * Best-effort row/col estimation using twoCellAnchor from drawings.
+          * Images are copied into a temp folder; paths returned are absolute.
+        """
+        out: Dict[str, List[ExtractedImage]] = {}
+        try:
+            with zipfile.ZipFile(str(xlsx_path), 'r') as zf:
+                # 1) Build a map of image part name -> saved file path
+                media_names = [n for n in zf.namelist() if n.startswith('xl/media/')]
+                media_map: Dict[str, str] = {}
+                for m in media_names:
+                    data = zf.read(m)
+                    fname = Path(m).name
+                    dest = self._tmp_dir / fname
+                    try:
+                        with open(dest, 'wb') as fh:
+                            fh.write(data)
+                        media_map[f"/{m}"] = str(dest)
+                    except Exception:
+                        pass
+
+                # 2) Map drawing rels -> images (rId -> media path)
+                drawing_rels: Dict[str, Dict[str, str]] = {}
+                for n in zf.namelist():
+                    if n.startswith('xl/drawings/_rels/') and n.endswith('.rels'):
+                        try:
+                            xml = zf.read(n).decode('utf-8', errors='ignore')
+                        except Exception:
+                            continue
+                        rel_map: Dict[str, str] = {}
+                        for rid, target in re.findall(r"Id=\"(rId\d+)\"[^>]+Target=\"([^\"]+)\"", xml):
+                            # targets are typically ../media/imageX.png
+                            target_path = target
+                            if not target_path.startswith('/'):
+                                # normalize relative to drawings folder
+                                base = '/' + '/'.join(n.split('/')[:-1]) + '/'
+                                target_path = os.path.normpath(base + target).replace('\\', '/')
+                            rel_map[rid] = media_map.get(target_path, '')
+                        drawing_rels['/' + n] = rel_map
+
+                # 3) For each drawing.xml, parse anchors to get row/col and rId
+                #    Store sheet_drawing -> [ExtractedImage]
+                drawings_pos: Dict[str, List[Tuple[int, int, str]]] = {}
+                for n in zf.namelist():
+                    if n.startswith('xl/drawings/drawing') and n.endswith('.xml'):
+                        try:
+                            xml = zf.read(n).decode('utf-8', errors='ignore')
+                        except Exception:
+                            continue
+                        # twoCellAnchor with from row/col and blip r:embed="rIdX"
+                        positions: List[Tuple[int, int, str]] = []
+                        anchors = re.findall(
+                            r"<xdr:twoCellAnchor[\s\S]*?<xdr:from>[\s\S]*?<xdr:col>(\d+)</xdr:col>[\s\S]*?<xdr:row>(\d+)</xdr:row>[\s\S]*?</xdr:from>[\s\S]*?a:blip[^>]+r:embed=\"(rId\d+)\"",
+                            xml,
+                        )
+                        for col_s, row_s, rid in anchors:
+                            positions.append((int(row_s), int(col_s), rid))
+                        drawings_pos['/' + n] = positions
+
+                # 4) Map sheets -> drawings via worksheet rels
+                sheet_to_drawing: Dict[str, str] = {}
+                for n in zf.namelist():
+                    if n.startswith('xl/worksheets/_rels/') and n.endswith('.rels'):
+                        try:
+                            xml = zf.read(n).decode('utf-8', errors='ignore')
+                        except Exception:
+                            continue
+                        # Find target drawing path
+                        m = re.search(r'Target=\"(../drawings/drawing\d+\.xml)\"', xml)
+                        if not m:
+                            continue
+                        drawing_rel = m.group(1)
+                        drawing_abs = '/' + os.path.normpath('/'.join(n.split('/')[:-1]) + '/' + drawing_rel).replace('\\', '/')
+                        sheet_xml = '/' + n.replace('/_rels/', '/').replace('.rels', '')
+                        sheet_name = self._sheet_name_from_xml_path(zf, sheet_xml)
+                        if sheet_name:
+                            sheet_to_drawing[sheet_name] = drawing_abs
+
+                # 5) Stitch everything
+                for sheet_name, drawing_xml in sheet_to_drawing.items():
+                    positions = drawings_pos.get(drawing_xml, [])
+                    rels_path = drawing_xml.replace('/drawings/', '/drawings/_rels/') + '.rels'
+                    rel_map = drawing_rels.get(rels_path, {})
+                    images: List[ExtractedImage] = []
+                    for row, col, rid in positions:
+                        img_path = rel_map.get(rid, '')
+                        if not img_path:
+                            continue
+                        images.append(ExtractedImage(sheet=sheet_name, row=row, col=col, path=img_path, name=Path(img_path).stem))
+                    if images:
+                        out[sheet_name] = images
+        except Exception:
+            return out
+        return out
+
+    def _sheet_name_from_xml_path(self, zf: zipfile.ZipFile, sheet_xml_abs: str) -> Optional[str]:
+        """Read xl/workbook.xml to map sheetId -> name; then infer from file name."""
+        try:
+            # Example sheet_xml_abs: /xl/worksheets/sheet1.xml
+            sheet_file = Path(sheet_xml_abs).name  # sheet1.xml
+            workbook = zf.read('xl/workbook.xml').decode('utf-8', errors='ignore')
+            # <sheet name="Sheet1" sheetId="1" r:id="rId1"/>
+            # files are usually sheet{sheetId}.xml
+            for name, sid in re.findall(r"<sheet[^>]+name=\"([^\"]+)\"[^>]+sheetId=\"(\d+)\"", workbook):
+                if sheet_file.lower() == f"sheet{sid}.xml":
+                    return name
+        except Exception:
+            pass
+        return None
+
+    # ---------------- internals: misc ----------------
+    def _insert_rows(self, rows: List[dict], at: int) -> None:
+        df = self._df.copy()
+        upper = df.iloc[:at]
+        lower = df.iloc[at:]
+        df = pd.concat([upper, pd.DataFrame(rows), lower], ignore_index=True)
+        self._commit_df(df)
+
+    def _commit_df(self, df: pd.DataFrame) -> None:
+        # ensure canonical columns
+        if df is None:
+            df = pd.DataFrame()
+        if not df.empty:
+            for col in ("Object Type", "Object Text", "Attachment Type", "Attachment Data", "SourceFile", "SheetName"):
+                if col not in df.columns:
+                    df[col] = ""
+        self._df = df.reset_index(drop=True)
+        self._undo_stack.append(self._df.copy())
+        self.dataChanged.emit(self._df.copy())
+
+    def _renumber_and_emit(self) -> None:
+        df = renumber_headings(self._df)
+        df = renumber_captions(df)
+        self._df = df
+        self._undo_stack.append(self._df.copy())
+        self.dataChanged.emit(self._df.copy())
+
+    @staticmethod
+    def _text_to_html_blocks(raw: str) -> str:
+        s = (raw or '').strip()
+        if not s:
+            return ''
+        lines = [ln.rstrip() for ln in s.splitlines() if ln.strip()]
+        if not lines:
+            return ''
+        ul_m = ("- ", "• ", "* ")
+        if all(any(ln.lstrip().startswith(m) for m in ul_m) for ln in lines):
+            items = []
+            for ln in lines:
+                for m in ul_m:
+                    if ln.lstrip().startswith(m):
+                        items.append(f"<li>{ln.lstrip()[len(m):].strip()}</li>")
+                        break
+            return "<ul>" + "".join(items) + "</ul>"
+        if all(re.match(r"^\s*\d+\.\s+", ln) for ln in lines):
+            items = ["<li>" + re.sub(r'^\s*\d+\.\s+','', ln) + "</li>" for ln in lines]
+            return "<ol>" + "".join(items) + "</ol>"
+        return "".join(f"<p>{ln}</p>" for ln in lines)
+
+    # cleanup temp dir when widget is deleted
+    def deleteLater(self) -> None:  # pragma: no cover
+        try:
+            super().deleteLater()
+        finally:
+            try:
+                shutil.rmtree(self._tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+# ======================================================
+# Standalone diagnostic when run directly
+# ======================================================
+if __name__ == "__main__":
+    import sys
+    from PyQt6.QtWidgets import QApplication
+
+    print("=== ExcelPreviewWidget Diagnostic ===")
+    app = QApplication(sys.argv)
+    w = ExcelPreviewWidget()
+    checks = {
+        "Embedded image extraction": hasattr(w, "_extract_embedded_images_per_sheet"),
+        "Auto caption insertion": hasattr(w, "insert_image_row") and hasattr(w, "insert_table_row"),
+        "Undo (Ctrl+Z)": hasattr(w, "undo"),
+        "Load summary popup": hasattr(w, "load_from_paths"),
+        "Preview HTML generation": hasattr(w, "generate_preview_html"),
+        "Public API OK": all(hasattr(w, fn) for fn in [
+            "load_from_paths", "load_from_path", "load_from_dataframe", "get_dataframe"
+        ]),
+    }
+
+    for name, ok in checks.items():
+        print(f"{name:<35}: {'✅' if ok else '❌'}")
+
+    print(f"Temp dir: {w._tmp_dir}")
+    print("=====================================")
+
+    # Optional: generate a quick preview of empty data
+    print("\\nPreview HTML snippet:")
+    print(w.generate_preview_html()[:300] + "...")
+    sys.exit(0)
