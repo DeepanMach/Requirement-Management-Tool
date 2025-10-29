@@ -104,6 +104,7 @@ class RequirementDataManager:
     # Controls whether Word import should drop front-matter (content before first Heading)
     skip_front_matter_for_word: bool = False
     front_matter_records: Dict[str, List[Dict[str, str]]] = field(default_factory=dict, init=False)
+    front_matter_count: Dict[str, int] = field(default_factory=dict, init=False)
     _custom_patterns: list[re.Pattern[str]] = field(default_factory=list, init=False)
     _REQ_ID_PATTERNS: ClassVar[Sequence[re.Pattern[str]]] = (
         re.compile(r"^\s*Requirement\s*ID\s*[:\-]\s*(?P<id>[A-Za-z0-9_.\-]+)\s*(?P<body>.*)$", re.IGNORECASE),
@@ -469,6 +470,7 @@ class RequirementDataManager:
 
         all_records: List[dict[str, str]] = []
         self.front_matter_records = {}
+        self.front_matter_count = {}
 
         for raw_path in paths:
             path = Path(raw_path)
@@ -487,7 +489,11 @@ class RequirementDataManager:
             records = self._extract_records_from_document(document, path.name, path.stem, progress_callback)
 
             # 2) Full-package image sweep (body, headers, footers, etc.), de-duplicated
-            extra_images = self.extract_all_images_from_docx(document, source_name=path.name, sheet_name=path.stem)
+            extra_images = []
+            # Avoid re-introducing front-page images when skipping front matter.
+            # Only perform full-package sweep when we are not skipping the first page.
+            if not getattr(self, "skip_front_matter_for_word", False):
+                extra_images = self.extract_all_images_from_docx(document, source_name=path.name, sheet_name=path.stem)
             if extra_images:
                 # de-dup by filename already present from paragraph-scan
                 existing_names: set[str] = set()
@@ -839,10 +845,11 @@ class RequirementDataManager:
         records: List[dict[str, str]] = []
         front_records: List[Dict[str, str]] = []
         body_started = False
+        first_page_done = False
 
         def add_record(payload: Dict[str, str], *, mark_body: bool = False) -> None:
             nonlocal body_started
-            if mark_body and not body_started:
+            if (mark_body or first_page_done) and not body_started:
                 body_started = True
             records.append(payload)
             if not body_started:
@@ -857,6 +864,11 @@ class RequirementDataManager:
 
             if isinstance(block, Paragraph):
                 style_name = (block.style.name or "").lower()
+                # Detect if this paragraph carries a page/section boundary
+                try:
+                    paragraph_has_boundary = self._paragraph_has_page_boundary(block)
+                except Exception:
+                    paragraph_has_boundary = False
 
                 if self._paragraph_has_image(block):
                     for img_record in self._collect_paragraph_images(block, source_name, sheet_name):
@@ -899,6 +911,8 @@ class RequirementDataManager:
                                 },
                                 mark_body=True,
                             )
+                            if paragraph_has_boundary and not first_page_done:
+                                first_page_done = True
                             continue
 
                 if req_id and obj_type == "Requirement":
@@ -913,6 +927,8 @@ class RequirementDataManager:
                         "Attachment Type": "",
                         "Attachment Data": "",
                     })
+                    if paragraph_has_boundary and not first_page_done:
+                        first_page_done = True
                     continue
 
                 if obj_type.startswith("Heading"):
@@ -927,6 +943,8 @@ class RequirementDataManager:
                         "Attachment Type": "",
                         "Attachment Data": "",
                     }, mark_body=True)
+                    if paragraph_has_boundary and not first_page_done:
+                        first_page_done = True
                     continue
 
                 add_record({
@@ -940,6 +958,8 @@ class RequirementDataManager:
                     "Attachment Type": "",
                     "Attachment Data": "",
                 })
+                if paragraph_has_boundary and not first_page_done:
+                    first_page_done = True
                 continue
 
             if isinstance(block, Table):
@@ -959,6 +979,10 @@ class RequirementDataManager:
                 })
 
         self.front_matter_records[source_name] = [copy.deepcopy(r) for r in front_records]
+        try:
+            self.front_matter_count[source_name] = int(len(front_records))
+        except Exception:
+            self.front_matter_count[source_name] = 0
 
         if not records:
             LOGGER.warning("No paragraphs or tables parsed from %s", source_name)
@@ -986,25 +1010,24 @@ class RequirementDataManager:
                     drop_idx.append(idx)
                 continue
             if skip_mode:
-                try:
-                    is_entry = (
-                        (skip_mode == "toc" and self._is_toc_entry_line(text)) or
-                        (skip_mode == "lof" and self._is_lof_entry_line(text)) or
-                        (skip_mode == "lot" and self._is_lot_entry_line(text))
-                    )
-                except Exception:
-                    is_entry = False
-                if is_entry or not text:
-                    drop_idx.append(idx)
-                    continue
-                skip_mode = None
+                # While in skip_mode drop everything until the next heading,
+                # regardless of exact entry formatting — this suppresses
+                # imported TOC/LOF/LOT blocks robustly.
+                drop_idx.append(idx)
+                continue
 
         if drop_idx:
             work = work.drop(drop_idx).reset_index(drop=True)
 
         if getattr(self, "skip_front_matter_for_word", False) and {"SourceFile", "Object Type"}.issubset(work.columns):
             drop_idx = []
-            for _, sub in work.groupby(work["SourceFile"].astype(str), sort=False):
+            have_counts = bool(getattr(self, 'front_matter_count', {}))
+            for src, sub in work.groupby(work["SourceFile"].astype(str), sort=False):
+                if have_counts and str(src) in self.front_matter_count:
+                    n = int(self.front_matter_count.get(str(src), 0))
+                    if n > 0:
+                        drop_idx.extend(list(sub.index[:n]))
+                        continue
                 heading_mask = sub["Object Type"].astype(str).str.lower().str.startswith("heading")
                 if not heading_mask.any():
                     # Try numeric heading detection: first row whose Object Text starts with 1 / 1.2 etc.
@@ -1062,6 +1085,34 @@ class RequirementDataManager:
             # Legacy VML image data
             if el.findall(f".//{vml_ns}imagedata"):
                 return True
+        return False
+
+    # ------------------------------------------------------------------
+    def _paragraph_has_page_boundary(self, paragraph) -> bool:
+        """Detect explicit page/section boundaries in a paragraph.
+
+        Looks for:\n- w:br w:type="page" (manual page break)\n- w:pPr/w:pageBreakBefore\n- w:pPr/w:sectPr (section break that typically starts a new page)
+        """
+        try:
+            # search runs for explicit page breaks
+            for run in paragraph.runs:
+                el = run._element
+                for br in el.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}br'):
+                    t = (br.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}type') or '').lower()
+                    if t == 'page':
+                        return True
+        except Exception:
+            pass
+
+        try:
+            # paragraph properties: pageBreakBefore or sectPr
+            p_el = paragraph._element
+            if p_el.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}pageBreakBefore'):
+                return True
+            if p_el.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}sectPr'):
+                return True
+        except Exception:
+            pass
         return False
 
     # ------------------------------------------------------------------

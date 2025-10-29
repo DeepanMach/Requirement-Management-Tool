@@ -402,6 +402,10 @@ class RestoreWorker(QThread):
                 mgr.configure_requirement_pattern(self._word_pattern)
                 all_dfs = []
                 total_reqs = 0
+                # Aggregate front-matter metadata across files because
+                # load_word_documents() resets these per invocation.
+                fm_agg = {}
+                fm_count_agg = {}
                 for path in self._word_files:
                     if self.isInterruptionRequested():
                         break
@@ -416,12 +420,26 @@ class RestoreWorker(QThread):
                     df_part = mgr.load_word_documents([path], progress_callback=update_progress, interactive=False)
                     all_dfs.append(df_part)
                     total_reqs += df_part["Object Type"].str.lower().eq("requirement").sum()
+                    # Merge front-matter records from this pass
+                    try:
+                        for k, v in getattr(mgr, 'front_matter_records', {}).items():
+                            fm_agg[k] = v
+                        for k, v in getattr(mgr, 'front_matter_count', {}).items():
+                            fm_count_agg[k] = v
+                    except Exception:
+                        pass
                     completed += 1
                     self.progress.emit(int(completed / total_steps * 100), f"Parsed {Path(path).name}")
 
                 if all_dfs:
                     out["word_df"] = pd.concat(all_dfs, ignore_index=True)
                     out["total_reqs"] = int(total_reqs)
+                    # Persist aggregated front-matter metadata on the manager
+                    try:
+                        mgr.front_matter_records = fm_agg
+                        mgr.front_matter_count = fm_count_agg
+                    except Exception:
+                        pass
 
             self.result.emit(out)
         except Exception as exc:
@@ -444,17 +462,22 @@ class ImportWorker(QThread):
     result = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, excel_files: list[str] | None = None, word_files: list[str] | None = None, word_pattern: dict | None = None, parent: QWidget | None = None):
+    def __init__(self, excel_files: list[str] | None = None, word_files: list[str] | None = None, word_pattern: dict | None = None, parent: QWidget | None = None, data_manager=None):
         super().__init__(parent)
         self._excel_files = [str(p) for p in (excel_files or []) if p]
         self._word_files = [str(p) for p in (word_files or []) if p]
         self._word_pattern = word_pattern or {}
+        # If provided, use the caller's data manager so flags like
+        # skip_front_matter_for_word and front-matter metadata persist.
+        self._data_manager = data_manager
 
     def run(self):
         from requirement_tool.data_manager import RequirementDataManager
         import pandas as pd
         try:
-            mgr = RequirementDataManager()
+            # Reuse caller's manager when available so that front-matter
+            # records and skip flags carry through to export.
+            mgr = self._data_manager if self._data_manager is not None else RequirementDataManager()
             out: dict = {"excel_df": None, "word_df": None, "total_reqs": 0}
             total_steps = (1 if self._excel_files else 0) + (len(self._word_files) if self._word_files else 0)
             total_steps = max(total_steps, 1)
@@ -767,6 +790,13 @@ class MainWindow(QMainWindow):
         if df is None or df.empty:
             return df
         work = df.reset_index(drop=True)
+        # 0) Remove image rows from the table view — not needed for editing in grid
+        try:
+            mask_img = work["Attachment Type"].astype(str).str.lower().eq("image")
+            if mask_img.any():
+                work = work[~mask_img].reset_index(drop=True)
+        except Exception:
+            pass
         # 1) Drop rows before the first heading (front page)
         try:
             mask_heading = work["Object Type"].astype(str).str.lower().str.startswith("heading")
@@ -1275,21 +1305,7 @@ class MainWindow(QMainWindow):
         self._existing_front_page_html: str = ""
         self._existing_front_page_source: str = ""
         self.console.append("Application Ready.")
-        try:
-            self.view_stack.setCurrentWidget(self.table_tabs)
-        except Exception:
-            pass
-        for _name in ('front_page','create_project_btn','recent_list'):
-            try:
-                _w = getattr(self, _name)
-                _w.hide()
-                if _name == 'front_page':
-                    try:
-                        self.view_stack.removeWidget(_w)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+        # Keep the front page visible by default as the landing view.
         self._wire_tooltips()
 
     def _on_engine_data_changed(self, df):
@@ -1808,7 +1824,7 @@ class MainWindow(QMainWindow):
         progress.setValue(0)
         QApplication.processEvents()
 
-        worker = ImportWorker(excel_files=normalized, parent=self)
+        worker = ImportWorker(excel_files=normalized, parent=self, data_manager=self.data_manager)
 
         def on_progress(pct: int, label: str):
             if label:
@@ -1889,7 +1905,8 @@ class MainWindow(QMainWindow):
                 "Reset to default front page",
                 "Clear all front page data",
             ]
-            choice, ok = QInputDialog.getItem(self, prompt_title, prompt_label, options, 0, False)
+            # Default to our template front page
+            choice, ok = QInputDialog.getItem(self, prompt_title, prompt_label, options, 1, False)
             if ok:
                 if choice.startswith("Keep existing"):
                     self._use_existing_front_page = True
@@ -1926,7 +1943,7 @@ class MainWindow(QMainWindow):
             front_page_source = Path(normalized[0]).name
         self._existing_front_page_source = front_page_source
 
-        worker = ImportWorker(word_files=normalized, word_pattern=cfg, parent=self)
+        worker = ImportWorker(word_files=normalized, word_pattern=cfg, parent=self, data_manager=self.data_manager)
 
         def on_progress(pct: int, label: str):
             if label:
@@ -2995,11 +3012,71 @@ class MainWindow(QMainWindow):
         width_pct = settings.get("preview_image_width_percent", 80)
         parts: list[str] = ["<div class='front-page existing-front-page'>"]
 
+        # Helpers to strip Table of Contents / List of Figures / List of Tables
+        def _norm_title(s: str) -> str:
+            s = (s or "").lower()
+            import re as _re
+            s = _re.sub(r"[^a-z\s]", " ", s)
+            s = _re.sub(r"\s+", " ", s).strip()
+            return s
+
+        def _auto_list_head(text: str):
+            t = _norm_title(text)
+            if t == "table of contents":
+                return "toc"
+            if t in {"list of figures", "list of figure"}:
+                return "lof"
+            if t in {"list of tables", "list of table"}:
+                return "lot"
+            return None
+
+        import re as _re
+        def _has_trailing_page_num(text: str) -> bool:
+            return bool(_re.search(r"(?:\t|\s{2,}|\.{2,})?\s\d{1,4}\s*$", str(text or "")))
+
+        def _is_toc_line(text: str) -> bool:
+            t = str(text or "")
+            if not _has_trailing_page_num(t):
+                return False
+            return bool(_re.match(r"^\s*\d+(?:\.\d+)*\s+\S", t))
+
+        def _is_lof_line(text: str) -> bool:
+            t = str(text or "")
+            if not _has_trailing_page_num(t):
+                return False
+            return bool(_re.match(r"^\s*(figure|fig\.)\s+\S+", t, flags=_re.I))
+
+        def _is_lot_line(text: str) -> bool:
+            t = str(text or "")
+            if not _has_trailing_page_num(t):
+                return False
+            return bool(_re.match(r"^\s*table\s+\S+", t, flags=_re.I))
+
+        skip_mode = None  # 'toc' | 'lof' | 'lot' | None
+
         for _, row in df.iterrows():
             obj_type = str(row.get("Object Type", "") or "").lower()
             text = str(row.get("Object Text", "") or "").strip()
             att_type = str(row.get("Attachment Type", "") or "").lower()
             att_data = str(row.get("Attachment Data", "") or "").strip()
+
+            # Strip auto-lists entirely from existing front-page preview
+            if obj_type.startswith("heading"):
+                skip_mode = None
+                kind = _auto_list_head(text)
+                if kind:
+                    skip_mode = kind
+                    continue  # drop the heading itself
+            if skip_mode:
+                is_entry = (
+                    (skip_mode == "toc" and _is_toc_line(text))
+                    or (skip_mode == "lof" and _is_lof_line(text))
+                    or (skip_mode == "lot" and _is_lot_line(text))
+                )
+                if is_entry or not text:
+                    continue
+                else:
+                    skip_mode = None
 
             if att_type == "image" and att_data:
                 try:
@@ -3048,9 +3125,15 @@ class MainWindow(QMainWindow):
         src = self._current_source_name()
         self._ensure_header_profile(src)
         settings = self._get_header_settings(src)
-        if getattr(self, "_use_existing_front_page", False) and self._existing_front_page_html:
-            styles = self._front_page_base_styles()
-            html_front = f"<html><head>{styles}</head><body>{self._existing_front_page_html}</body></html>"
+        use_existing = bool(getattr(self, "_use_existing_front_page", False))
+        if use_existing:
+            # In 'keep existing' mode, do not fallback to the default template.
+            if self._existing_front_page_html:
+                styles = self._front_page_base_styles()
+                html_front = f"<html><head>{styles}</head><body>{self._existing_front_page_html}</body></html>"
+            else:
+                styles = self._front_page_base_styles()
+                html_front = f"<html><head>{styles}</head><body><div class='front-page existing-front-page'>No extracted front page available.</div></body></html>"
         else:
             html_front = self._compose_front_page_html(settings)
         dlg = QDialog(self)
@@ -3127,8 +3210,9 @@ class MainWindow(QMainWindow):
         """
         wm_text = str(settings.get("watermark_text", "") or "").strip()
         # Determine front page HTML
-        if getattr(self, "_use_existing_front_page", False) and getattr(self, "_existing_front_page_html", ""):
-            front_page_html = self._existing_front_page_html
+        if getattr(self, "_use_existing_front_page", False):
+            # In 'keep existing' mode, do not render the default template.
+            front_page_html = getattr(self, "_existing_front_page_html", "") or ""
         else:
             front_page_html = self._build_front_page_html(settings)
 
@@ -3163,6 +3247,43 @@ class MainWindow(QMainWindow):
                 if kind == "table" and lower.startswith("table"):
                     return next_text, offset
             return "", None
+
+        # Determine and skip front-matter rows for ALL sources to avoid duplicating front content
+        try:
+            if "SourceFile" in local_df.columns:
+                front_counts = getattr(self.data_manager, 'front_matter_count', {}) or {}
+                if front_counts:
+                    for src_name, count in front_counts.items():
+                        try:
+                            n_front = int(count or 0)
+                        except Exception:
+                            n_front = 0
+                        if n_front <= 0:
+                            continue
+                        src_mask = local_df["SourceFile"].astype(str).str.strip().eq(str(src_name))
+                        src_idx = list(local_df[src_mask].index)
+                        if src_idx:
+                            skip_indices.update(src_idx[:n_front])
+        except Exception:
+            pass
+
+        # Gather front-page image filenames across ALL sources (to suppress in body)
+        front_image_names: set[str] = set()
+        try:
+            import json as _json
+            if hasattr(self.data_manager, 'front_matter_records'):
+                for src_name, recs in (self.data_manager.front_matter_records or {}).items():
+                    for r in recs:
+                        if str(r.get("Attachment Type", "")).lower() == "image":
+                            try:
+                                payload = _json.loads(r.get("Attachment Data", "") or "{}")
+                                nm = str(payload.get("filename", "")).strip()
+                                if nm:
+                                    front_image_names.add(nm)
+                            except Exception:
+                                pass
+        except Exception:
+            pass
 
         for idx, row in local_df.iterrows():
             if idx in skip_indices:
@@ -3213,17 +3334,21 @@ class MainWindow(QMainWindow):
 
             # --- Images ---
             if attachment_type == "image" and attachment_data:
-                figure_count += 1
-                figure_id = f"figure-{global_idx}"
                 try:
                     payload = json.loads(attachment_data)
                 except json.JSONDecodeError:
                     payload = {"data": attachment_data, "mime": "image/png", "filename": text or "Image"}
+                # Suppress images that originated from the front page
+                img_name = (payload.get("filename") or "").strip()
+                if img_name and img_name in front_image_names:
+                    continue
+                figure_count += 1
+                figure_id = f"figure-{global_idx}"
                 image_data = payload.get("data", "")
                 if not image_data:
                     continue
                 mime = payload.get("mime", "image/png")
-                caption_text = text or payload.get("filename", "")
+                caption_text = text or img_name
                 caption_idx: Optional[int] = None
                 if not caption_text:
                     caption_text, caption_idx = _guess_caption(idx, "figure")
@@ -3798,16 +3923,28 @@ class MainWindow(QMainWindow):
             parse_xml,
             nsdecls,
         )
-        self._add_front_matter(
-            document,
-            settings,
-            WD_ALIGN_PARAGRAPH,
-            Pt,
-            Inches,
-            WD_TABLE_ALIGNMENT,
-            OxmlElement,
-            qn,
-        )
+        # Front page
+        use_existing_mode = bool(getattr(self, "_use_existing_front_page", False))
+        use_existing_html = bool(getattr(self, "_existing_front_page_html", ""))
+        if use_existing_mode and use_existing_html:
+            self._add_existing_front_page_from_html(
+                document,
+                self._existing_front_page_html,
+                WD_ALIGN_PARAGRAPH,
+                Inches,
+                BeautifulSoup,
+            )
+        elif not use_existing_mode:
+            self._add_front_matter(
+                document,
+                settings,
+                WD_ALIGN_PARAGRAPH,
+                Pt,
+                Inches,
+                WD_TABLE_ALIGNMENT,
+                OxmlElement,
+                qn,
+            )
         document.add_page_break()
         self._add_table_of_contents(document, settings, OxmlElement, qn)
         document.add_page_break()
@@ -3823,7 +3960,33 @@ class MainWindow(QMainWindow):
             qn,
             RGBColor,
         )
-        document.save(file_name)
+        # Robust save: handle cases where the target file is open or locked
+        try:
+            document.save(file_name)
+        except PermissionError:
+            QMessageBox.warning(
+                self,
+                "File In Use",
+                "The selected file appears to be open or write-protected.\n"
+                "Please close it or choose a different filename.",
+            )
+            alt_name, _ = QFileDialog.getSaveFileName(
+                self, "Save Word File As", file_name, "Word Document (*.docx)"
+            )
+            if not alt_name:
+                return
+            if not alt_name.endswith(".docx"):
+                alt_name += ".docx"
+            try:
+                document.save(alt_name)
+                file_name = alt_name
+            except Exception as exc:
+                QMessageBox.critical(self, "Save Error", f"Could not save file.\n{exc}")
+                return
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Error", f"Could not save file.\n{exc}")
+            return
+
         self.log_console(
             f"Word file saved: {file_name} (update fields in Word to refresh TOC)"
         )
@@ -4071,6 +4234,89 @@ class MainWindow(QMainWindow):
         lot_field.set(qn("w:instr"), 'TOC \\h \\z \\c "Table"')
         lot_para._p.append(lot_field)
 
+    # ------------------------------------------------------------------
+    def _add_existing_front_page_from_html(
+        self,
+        document,
+        html_block: str,
+        WD_ALIGN_PARAGRAPH,
+        Inches,
+        BeautifulSoup,
+    ) -> None:
+        """Render the extracted front-page HTML into the Word document.
+
+        Supports a minimal subset used by our preview:
+        - h1/h2/h3 headings -> Word headings
+        - p paragraphs -> paragraphs
+        - div.image-block img[data-uri] -> image centered, with no caption
+        - div.table-block table -> simple grid table
+        Other elements are ignored gracefully.
+        """
+        soup = BeautifulSoup(html_block or "", "html.parser")
+        root = soup.body or soup
+
+        def _add_img_from_data_uri(img_tag):
+            src = (img_tag.get("src") or "").strip()
+            if not src.startswith("data:"):
+                return
+            try:
+                header, b64 = src.split(",", 1)
+            except ValueError:
+                return
+            import base64, io
+            try:
+                data = base64.b64decode(b64)
+            except Exception:
+                return
+            stream = io.BytesIO(data)
+            p = document.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            try:
+                p.add_run().add_picture(stream, width=Inches(5.5))
+            except Exception:
+                return
+
+        def _add_table_from_html(table_outer):
+            inner = str(table_outer)
+            self._add_table_from_html(
+                document,
+                inner,
+                "",
+                BeautifulSoup,
+                WD_ALIGN_PARAGRAPH,
+                None,
+                None,
+                None,
+                None,
+            )
+
+        for child in list(root.children):
+            if getattr(child, "name", None) is None:
+                continue
+            tag = child.name.lower()
+            if tag in {"h1", "h2", "h3"}:
+                level = {"h1": 1, "h2": 2, "h3": 3}[tag]
+                txt = child.get_text(strip=True)
+                if txt:
+                    document.add_heading(txt, level=level)
+                continue
+            if tag == "p":
+                txt = child.get_text(" ", strip=True)
+                if txt:
+                    para = document.add_paragraph(txt)
+                    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                continue
+            if tag == "div" and "image-block" in (child.get("class") or []):
+                img = child.find("img")
+                if img:
+                    _add_img_from_data_uri(img)
+                continue
+            if tag == "div" and "table-block" in (child.get("class") or []):
+                table = child.find("table")
+                if table:
+                    _add_table_from_html(table)
+                continue
+
     def add_trace_column(self):
         """
         Adds an 'Up Trace' or 'Down Trace' column dynamically when the user requests tracing.
@@ -4116,6 +4362,24 @@ class MainWindow(QMainWindow):
 
         pending_requirement_rule = False
 
+        # Identify front-page image filenames for the active source to suppress in export
+        front_image_names: set[str] = set()
+        try:
+            cur_src = self._current_source_name()
+            if cur_src:
+                import json as _json
+                for r in self.data_manager.get_front_matter_records(cur_src):
+                    if str(r.get("Attachment Type", "")).lower() == "image":
+                        try:
+                            payload = _json.loads(r.get("Attachment Data", "") or "{}")
+                            nm = str(payload.get("filename", "")).strip()
+                            if nm:
+                                front_image_names.add(nm)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
         for index, row in df.iterrows():
             global_index = int(row.get("_global_index", index)) if "_global_index" in row else index
             obj_type = str(row.get("Object Type", "")).strip().lower()
@@ -4156,6 +4420,14 @@ class MainWindow(QMainWindow):
                 continue
 
             if attachment_type == "image" and attachment_data:
+                # Skip images that came from front page
+                try:
+                    payload_test = json.loads(attachment_data)
+                    nm = str(payload_test.get("filename", "")).strip()
+                except Exception:
+                    nm = ""
+                if nm and nm in front_image_names:
+                    continue
                 self._add_image_from_payload(
                     document,
                     attachment_data,
