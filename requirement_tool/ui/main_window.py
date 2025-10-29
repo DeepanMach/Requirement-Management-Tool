@@ -357,8 +357,10 @@ class ExcelTab(QWidget):
     - Holds a pandas DataFrame in self.df (editable via cell edits).
     - Can build HTML preview using the same logic as your standalone preview.
     """
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, engine=None):
         super().__init__(parent)
+        # Backend engine (ExcelPreviewWidget) used to load/preview data
+        self.engine = engine
         self.df = None
 
         lay = QVBoxLayout(self)
@@ -394,7 +396,7 @@ class ExcelTab(QWidget):
 
 
 
-    # ------ Build HTML (for MainWindow’s preview) ------
+    # ------ Build HTML (for MainWindowÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢s preview) ------
     def build_preview_html(self) -> str:
         """
         Delegate to backend for consistent, feature-complete HTML (headings, tables,
@@ -441,7 +443,7 @@ class ExcelTab(QWidget):
                         self._model.setItem(r, ci, QStandardItem("[Missing Image]"))
                 elif is_table_marker(val):
                     rows, cols2, data, name = load_table_payload(val)
-                    lbl = f"{name} — " if name else ""
+                    lbl = f"{name} ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â " if name else ""
                     self._model.setItem(r, ci, QStandardItem(f"{lbl}Table {rows}x{cols2}"))
                 else:
                     it = QStandardItem(str(val))
@@ -480,7 +482,7 @@ class ExcelTab(QWidget):
         index = self.table.indexAt(pos)
         if not index.isValid():
             return
-        # (kept simple—your main header filter UI can remain in MainWindow if needed)
+        # (kept simpleÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Âyour main header filter UI can remain in MainWindow if needed)
         menu = QMenu(self)
         menu.addAction("Resize Columns to Contents", lambda: [self.table.resizeColumnToContents(i) for i in range(self._model.columnCount())])
         menu.exec(self.table.viewport().mapToGlobal(pos))
@@ -493,7 +495,7 @@ class ExcelTab(QWidget):
         lines = [ln.rstrip() for ln in s.splitlines() if ln.strip()]
         if not lines:
             return ""
-        ul_m = ("- ", "• ", "* ")
+        ul_m = ("- ", "ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢ ", "* ")
         if all(any(ln.lstrip().startswith(m) for m in ul_m) for ln in lines):
             items = []
             for ln in lines:
@@ -518,6 +520,103 @@ class MainWindow(QMainWindow):
         projects = (repo_root / "projects").resolve()
         projects.mkdir(parents=True, exist_ok=True)
         return projects
+
+    def _populate_header_from_docx(self, path: str) -> None:
+        """Best-effort: read core properties and first-page hints into header profile."""
+        try:
+            from docx import Document  # type: ignore
+        except Exception:
+            return
+        try:
+            doc = Document(path)
+        except Exception:
+            return
+        core = getattr(doc, "core_properties", None)
+        src = self._current_source_name()
+        self._ensure_header_profile(src)
+        settings = self._get_header_settings(src)
+        try:
+            title = getattr(core, "title", None) if core else None
+            author = getattr(core, "author", None) if core else None
+            revision = getattr(core, "revision", None) if core else None
+        except Exception:
+            title = author = revision = None
+        if title and not settings.get("document_title"):
+            settings["document_title"] = str(title)
+        if author and not settings.get("author_name"):
+            settings["author_name"] = str(author)
+        if revision and not settings.get("revision"):
+            settings["revision"] = str(revision)
+        # Try first non-empty paragraph as fallback for title
+        try:
+            first_text = next((p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()), "")
+            if first_text and not settings.get("document_title"):
+                settings["document_title"] = first_text[:120]
+        except Exception:
+            pass
+
+    # Hide front page and auto lists (TOC/LoF/LoT) only in the table view for Word sources
+    def _filter_docx_table_display(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        work = df.reset_index(drop=True)
+        # 1) Drop rows before the first heading (front page)
+        try:
+            mask_heading = work["Object Type"].astype(str).str.lower().str.startswith("heading")
+            # Fallback: consider numbered headings like "1", "1.2", etc., but ignore TOC entry lines
+            if not mask_heading.any():
+                try:
+                    numbered = work["Object Text"].astype(str).str.match(r"^\s*\d+(?:\.\d+)*\s+\S")
+                except Exception:
+                    numbered = None
+                if numbered is not None and numbered.any():
+                    mask_heading = numbered
+            if mask_heading.any():
+                first_head_idx = int(mask_heading.idxmax())
+                work = work.iloc[first_head_idx:].reset_index(drop=True)
+        except Exception:
+            pass
+
+        # 2) Remove auto lists: skip heading "Table of Contents" / "List of Figures/Tables" and
+        #    subsequent entry lines until the next heading
+        filtered_rows = []
+        skip_mode = None  # 'toc' | 'lof' | 'lot' | None
+        for _, row in work.iterrows():
+            ot = str(row.get("Object Type", "") or "").lower()
+            text = str(row.get("Object Text", "") or "").strip()
+
+            if ot.startswith("heading"):
+                skip_mode = None
+                # Is this an auto-list heading?
+                try:
+                    mode = self.data_manager._is_auto_list_heading(text)
+                except Exception:
+                    mode = None
+                if mode:
+                    skip_mode = mode
+                    continue  # drop the heading itself
+                filtered_rows.append(row)
+                continue
+
+            if skip_mode:
+                try:
+                    is_entry = (
+                        (skip_mode == "toc" and self.data_manager._is_toc_entry_line(text)) or
+                        (skip_mode == "lof" and self.data_manager._is_lof_entry_line(text)) or
+                        (skip_mode == "lot" and self.data_manager._is_lot_entry_line(text))
+                    )
+                except Exception:
+                    is_entry = False
+                if is_entry or not text:
+                    continue
+                else:
+                    skip_mode = None
+
+            filtered_rows.append(row)
+
+        if filtered_rows:
+            return pd.DataFrame(filtered_rows).reset_index(drop=True)
+        return work
 
     def _reset_ui_state(self) -> None:
         """Clear all in-memory/UI artifacts so a new project opens cleanly."""
@@ -563,7 +662,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         try:
-            self.setWindowTitle(f"Mach Requirement Management Tool — {self.project_name}")
+            self.setWindowTitle(f"Mach Requirement Management Tool ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â {self.project_name}")
         except Exception:
             pass
 
@@ -615,7 +714,7 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(200, _delayed_restore)
                 return
 
-            # 3) Nothing to restore → start clean (prevents cross-project bleed)
+            # 3) Nothing to restore ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ start clean (prevents cross-project bleed)
             self.header_profiles.clear()
             if hasattr(self, "data_manager"):
                 self.data_manager.dataframe = self.data_manager.create_empty_dataframe()
@@ -683,7 +782,7 @@ class MainWindow(QMainWindow):
         header_bar = QHBoxLayout()
         self.project_label = QLabel("No project open")
         self.project_label.setStyleSheet("font-weight: 600;")
-        self.create_project_btn = QPushButton("＋ Create Project")
+        self.create_project_btn = QPushButton("Create Project")
         self.create_project_btn.setObjectName("createProject")
         self.create_project_btn.setToolTip("Create a new project and start adding requirements")
         self.create_project_btn.clicked.connect(self.create_project)
@@ -695,8 +794,8 @@ class MainWindow(QMainWindow):
         self.setStyleSheet("#createProject { font-size: 15px; padding: 8px 14px; }")
 
         button_row = QHBoxLayout()
-        # 🏠 Home button
-        self.home_btn = QPushButton("🏠 Home")
+        # ÃƒÂ°Ã…Â¸Ã‚ÂÃ‚Â  Home button
+        self.home_btn = QPushButton("Home")
         self.home_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.home_btn.clicked.connect(self.return_to_main_page)
         button_row.addWidget(self.home_btn)
@@ -732,7 +831,7 @@ class MainWindow(QMainWindow):
         self.btn_search = QPushButton("Find Next")
         self.btn_prev = QPushButton("Find Previous")
         self.btn_clear_results = QPushButton("Clear Results")
-        search_row.addWidget(QLabel("🔍 Search:"))
+        search_row.addWidget(QLabel("Search:"))
         search_row.addWidget(self.search_input, 4)
         search_row.addWidget(self.btn_prev)
         search_row.addWidget(self.btn_search)
@@ -760,12 +859,16 @@ class MainWindow(QMainWindow):
         self.add_table_btn.clicked.connect(self.add_table_attachment)
         self.edit_header_btn = QPushButton("Edit Header Details")
         self.edit_header_btn.clicked.connect(self.edit_header_details)
+        self.preview_front_btn = QPushButton("Preview Front Page")
+        self.preview_front_btn.setToolTip("Show only the front page preview to edit header details")
+        self.preview_front_btn.clicked.connect(self.preview_front_page_only)
         self.remove_tab_btn = QPushButton("Remove Tab")
         self.remove_tab_btn.clicked.connect(self.remove_current_tab)
         for button in (
             self.add_image_btn,
             self.add_table_btn,
             self.edit_header_btn,
+            self.preview_front_btn,
             self.remove_tab_btn,
         ):
             attachment_row.addWidget(button)
@@ -787,8 +890,8 @@ class MainWindow(QMainWindow):
 
         # Toggle buttons for Navigation and Search Results
         nav_toggle_row = QHBoxLayout()
-        self.btn_nav_view = QPushButton("📜 Navigation")
-        self.btn_search_view = QPushButton("🔍 Search")
+        self.btn_nav_view = QPushButton("Navigation")
+        self.btn_search_view = QPushButton("Search")
         self.btn_nav_view.setCheckable(True)
         self.btn_search_view.setCheckable(True)
         self.btn_nav_view.setChecked(True)
@@ -838,7 +941,7 @@ class MainWindow(QMainWindow):
         title = QLabel("Welcome — Create a Project to get started")
         title.setStyleSheet("font-size: 18px; font-weight: 700;")
         title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        big_btn = QPushButton("＋ Create Project")
+        big_btn = QPushButton("Create Project")
         big_btn.setMinimumHeight(56)
         big_btn.setStyleSheet("font-size: 16px;")
         big_btn.setToolTip("Create a new project and go to the Requirements tab")
@@ -928,10 +1031,13 @@ class MainWindow(QMainWindow):
                 "Any reproduction, disclosure or use thereof is prohibited except as authorized in writing by Howell Instruments, Inc. "
                 "Recipient accepts the responsibility for maintaining the confidentiality of the contents of this document."
             ),
-            "copyright_notice": "© 2025 Howell Instruments. All rights reserved.",
+            "copyright_notice": "Ãƒâ€šÃ‚Â© 2025 Howell Instruments. All rights reserved.",
             "watermark_text": "",
         }
         self.header_profiles: Dict[str, Dict[str, object]] = {}
+        self._use_existing_front_page: bool = False
+        self._existing_front_page_html: str = ""
+        self._existing_front_page_source: str = ""
         self.console.append("Application Ready.")
         try:
             self.view_stack.setCurrentWidget(self.table_tabs)
@@ -972,8 +1078,8 @@ class MainWindow(QMainWindow):
         act_dup       = menu.addAction("Duplicate Row")
         act_del       = menu.addAction("Delete Row")
         menu.addSeparator()
-        act_img       = menu.addAction("🖼 Insert Image")
-        act_tbl       = menu.addAction("📋 Insert Table")
+        act_img       = menu.addAction("Insert Image")
+        act_tbl       = menu.addAction("Insert Table")
         menu.addSeparator()
         act_hide_col  = menu.addAction("Hide Column")
         act_show_cols = menu.addAction("Show All Columns")
@@ -1153,7 +1259,7 @@ class MainWindow(QMainWindow):
             self.add_image_btn: "Insert an image as an attachment below the selected row",
             self.add_table_btn: "Insert a table attachment from CSV/Excel below the selected row",
             self.edit_header_btn: "Edit header/footer, front page details, logos and watermark",
-            self.remove_tab_btn: "Remove the current tab’s data from the project",
+            self.remove_tab_btn: "Remove the current tab's data from the project",
             self.btn_nav_view: "Show the navigation tree (Headings 1–3)",
             self.btn_search_view: "Show search results for the current tab",
             self.btn_search: "Go to the next search match",
@@ -1491,6 +1597,12 @@ class MainWindow(QMainWindow):
         cfg = pattern if (pattern and pattern.get("value")) else self._last_pattern_config
         self.data_manager.configure_requirement_pattern(cfg)
 
+        # Reset front page handling state for this import
+        self.data_manager.skip_front_matter_for_word = False
+        self._use_existing_front_page = False
+        self._existing_front_page_html = ""
+        self._existing_front_page_source = ""
+
         progress = QProgressDialog("Loading requirements...", None, 0, 100, self)
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
         progress.setMinimumDuration(0)
@@ -1505,6 +1617,53 @@ class MainWindow(QMainWindow):
             all_dfs = []
             total_reqs = 0
 
+            front_page_source = ""
+            try:
+                from PyQt6.QtWidgets import QInputDialog
+                prompt_title = "Front Page Handling"
+                prompt_label = "Front page import:"  # applies to Word -> table import
+                options = [
+                    "Keep existing front page (do not import first page)",
+                    "Reset to default front page",
+                    "Clear all front page data",
+                ]
+                choice, ok = QInputDialog.getItem(self, prompt_title, prompt_label, options, 0, False)
+                if ok:
+                    if choice.startswith("Keep existing"):
+                        self._use_existing_front_page = True
+                        self.data_manager.skip_front_matter_for_word = True
+                        if normalized:
+                            front_page_source = Path(normalized[0]).name
+                            try:
+                                self._populate_header_from_docx(normalized[0])
+                            except Exception:
+                                pass
+                    elif choice.startswith("Reset to default"):
+                        self._use_existing_front_page = False
+                        self._existing_front_page_html = ""
+                        self._existing_front_page_source = ""
+                        src = self._current_source_name()
+                        self.header_profiles[self._header_key(src)] = copy.deepcopy(self.default_header_settings)
+                        self.data_manager.skip_front_matter_for_word = True
+                    elif choice.startswith("Clear all"):
+                        self._use_existing_front_page = False
+                        self._existing_front_page_html = ""
+                        self._existing_front_page_source = ""
+                        src = self._current_source_name()
+                        cleared = {k: ("" if isinstance(v, str) else v) for k, v in self.default_header_settings.items()}
+                        self.header_profiles[self._header_key(src)] = cleared
+                        self.data_manager.skip_front_matter_for_word = True
+                    else:
+                        self.data_manager.skip_front_matter_for_word = True
+                else:
+                    self.data_manager.skip_front_matter_for_word = True
+            except Exception:
+                self.data_manager.skip_front_matter_for_word = True
+
+            if self._use_existing_front_page and not front_page_source and normalized:
+                front_page_source = Path(normalized[0]).name
+            self._existing_front_page_source = front_page_source
+
             for i, path in enumerate(normalized, 1):
                 progress.setLabelText(f"Extracting from: {Path(path).name}")
                 progress.setValue(0)
@@ -1518,8 +1677,20 @@ class MainWindow(QMainWindow):
                 new_df = self.data_manager.load_word_documents([path], progress_callback=update_progress)
                 all_dfs.append(new_df)
 
+                if self._use_existing_front_page and not self._existing_front_page_source:
+                    self._existing_front_page_source = Path(path).name
+
                 req_count = new_df["Object Type"].str.lower().eq("requirement").sum()
                 total_reqs += req_count
+
+            if self._use_existing_front_page and self._existing_front_page_source:
+                try:
+                    self._build_existing_front_page_html(self._existing_front_page_source)
+                except Exception:
+                    self._existing_front_page_html = ""
+            if self._use_existing_front_page and not self._existing_front_page_html:
+                self._use_existing_front_page = False
+                self.log_console("Existing front page could not be extracted; using template instead.")
 
             df = pd.concat(all_dfs, ignore_index=True)
             df = self.data_manager.merge_new_dataframe(df)
@@ -1534,13 +1705,17 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Requirements Loaded",
-                f"✅ {total_reqs} requirements loaded successfully."
+                f"{total_reqs} requirements loaded successfully."
             )
 
         except RequirementDataError as exc:
             LOGGER.exception("Failed to load Word documents")
             QMessageBox.critical(self, "Load Error", str(exc))
         finally:
+            try:
+                self.data_manager.skip_front_matter_for_word = False
+            except Exception:
+                pass
             progress.close()
 
 
@@ -1738,6 +1913,12 @@ class MainWindow(QMainWindow):
 
             # Apply filters/sort for this tab before painting rows
             display_df = self._apply_table_filters(source_name, group, base_columns)
+            # For Word source groups, hide front page and auto-generated lists in the table view only
+            if str(source_type).lower() in {"doc", "docx", "docm", "word"}:
+                try:
+                    display_df = self._filter_docx_table_display(display_df)
+                except Exception:
+                    pass
             display_df = self._apply_table_sort(source_name, display_df, base_columns)
 
             table.setRowCount(len(display_df))
@@ -1858,7 +2039,7 @@ class MainWindow(QMainWindow):
                     if cells:
                         preview_lines.append(" | ".join(cells))
                 if total_rows > 5:
-                    preview_lines.append("…")
+                    preview_lines.append("ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦")
 
             if not preview_lines:
                 stripped = self._strip_html_to_text(data_str)
@@ -2403,6 +2584,183 @@ class MainWindow(QMainWindow):
             df = self._get_dataframe_for_source(source, raw=True)
             self.word_preview.setHtml(self.compose_preview_html(df))
 
+    def _front_page_base_styles(self) -> str:
+        return """
+        <style>
+            body { font-family: Arial, sans-serif; font-size: 11pt; color: #000; margin: 20px; }
+            .front-page { border: 2px solid #000; padding: 28px; margin-bottom: 12px; }
+            .front-title { text-align: center; font-size: 18pt; font-weight: bold; margin-bottom: 12px; }
+            .meta-lines { text-align: center; font-size: 12pt; margin-bottom: 16px; }
+            .logo-row { display: flex; justify-content: space-between; align-items: center; margin: 20px 0; }
+            .logo-cell { width: 48%; text-align: center; }
+            .logo-cell img { max-height: 90px; }
+            .address-row { display: flex; justify-content: space-between; }
+            .address-block { width: 48%; text-align: left; line-height: 1.4; }
+            .notice { border: 1px solid #000; padding: 12px; margin-top: 16px; }
+            .notice-title { font-weight: bold; text-align: center; margin-bottom: 8px; }
+            .copyright { text-align: center; margin-top: 12px; font-size: 10pt; }
+            .existing-front-page { border-style: dashed; }
+        </style>
+        """
+
+    def _compose_front_page_html(self, settings: Optional[Dict[str, object]] = None) -> str:
+        settings = settings or self._get_header_settings()
+        styles = self._front_page_base_styles()
+        def _logo_img_tag(path: str, alt: str) -> str:
+            if not path:
+                return ""
+            try:
+                data = Path(path).read_bytes()
+            except OSError:
+                return ""
+            mime = mimetypes.guess_type(path)[0] or "image/png"
+            encoded = base64.b64encode(data).decode("ascii")
+            return f'<img src="data:{mime};base64,{encoded}" alt="{html.escape(alt)}" />'
+
+        title = html.escape(str(settings.get("document_title", "")))
+        doc_no = html.escape(str(settings.get("document_number", "")))
+        revision = html.escape(str(settings.get("revision", "")))
+        author_name = html.escape(str(settings.get("author_name", "")))
+        author_title = html.escape(str(settings.get("author_title", "")))
+        reviewer_name = html.escape(str(settings.get("reviewer_name", "")))
+        reviewer_title = html.escape(str(settings.get("reviewer_title", "")))
+        qa_name = html.escape(str(settings.get("qa_name", "")))
+        qa_title = html.escape(str(settings.get("qa_title", "")))
+        config_name = html.escape(str(settings.get("config_manager_name", "")))
+        config_title = html.escape(str(settings.get("config_manager_title", "")))
+        logo_left = str(settings.get("logo_left_path", ""))
+        logo_right = str(settings.get("logo_right_path", ""))
+        addr_howell = str(settings.get("address_howell", ""))
+        addr_mach = str(settings.get("address_mach", ""))
+        prop_notice = str(settings.get("proprietary_notice", ""))
+        copyright_n = html.escape(str(settings.get("copyright_notice", "")))
+
+        html_front = [styles, "<div class='front-page'>"]
+        if title:
+            html_front.append(f"<div class='front-title'>{title}</div>")
+        meta = []
+        if doc_no:
+            meta.append(f"Document Number: {doc_no}")
+        if revision:
+            meta.append(f"Revision: {revision}")
+        if meta:
+            html_front.append(f"<div class='meta-lines'>{' | '.join(meta)}</div>")
+        # Logos
+        logos = []
+        left_tag = _logo_img_tag(logo_left, "Left Logo")
+        right_tag = _logo_img_tag(logo_right, "Right Logo")
+        if left_tag or right_tag:
+            logos.append("<div class='logo-row'>")
+            logos.append(f"<div class='logo-cell'>{left_tag}</div>")
+            logos.append(f"<div class='logo-cell'>{right_tag}</div>")
+            logos.append("</div>")
+        html_front.extend(logos)
+        # Addresses
+        if addr_howell or addr_mach:
+            html_front.append("<div class='address-row'>")
+            html_front.append(f"<div class='address-block'>{addr_howell}</div>")
+            html_front.append(f"<div class='address-block'>{addr_mach}</div>")
+            html_front.append("</div>")
+        # Signatures/people
+        sig_lines = []
+        if author_name:
+            sig_lines.append(f"<div><span class='signature-name'>{author_name}</span> <span class='signature-title'>{author_title}</span></div>")
+        if reviewer_name:
+            sig_lines.append(f"<div><span class='signature-name'>{reviewer_name}</span> <span class='signature-title'>{reviewer_title}</span></div>")
+        if qa_name:
+            sig_lines.append(f"<div><span class='signature-name'>{qa_name}</span> <span class='signature-title'>{qa_title}</span></div>")
+        if config_name:
+            sig_lines.append(f"<div><span class='signature-name'>{config_name}</span> <span class='signature-title'>{config_title}</span></div>")
+        if sig_lines:
+            html_front.append("<div class='meta-lines'>" + "".join(sig_lines) + "</div>")
+        # Proprietary notice
+        if prop_notice:
+            html_front.append("<div class='notice'><div class='notice-title'>Proprietary Notice</div>" + prop_notice + "</div>")
+        if copyright_n:
+            html_front.append(f"<div class='copyright'>{copyright_n}</div>")
+        html_front.append("</div>")
+        return "".join(html_front)
+
+    def _render_front_rows_to_html(self, df: pd.DataFrame) -> str:
+        if df is None or df.empty:
+            return ""
+
+        settings = self._get_header_settings()
+        wm_text = str(settings.get("watermark_text", "") or "").strip()
+        width_pct = settings.get("preview_image_width_percent", 80)
+        parts: list[str] = ["<div class='front-page existing-front-page'>"]
+
+        for _, row in df.iterrows():
+            obj_type = str(row.get("Object Type", "") or "").lower()
+            text = str(row.get("Object Text", "") or "").strip()
+            att_type = str(row.get("Attachment Type", "") or "").lower()
+            att_data = str(row.get("Attachment Data", "") or "").strip()
+
+            if att_type == "image" and att_data:
+                try:
+                    payload = json.loads(att_data)
+                except json.JSONDecodeError:
+                    payload = {"data": att_data, "mime": "image/png", "filename": text or "Image"}
+                data = payload.get("data", "")
+                if not data:
+                    continue
+                mime = payload.get("mime", "image/png")
+                alt = payload.get("filename", text) or "Image"
+                parts.append(
+                    f"<div class='image-block'><img src='data:{mime};base64,{data}' alt='{html.escape(alt)}' "
+                    f"style='max-width:{width_pct}%; width:{width_pct}%; height:auto;'/></div>"
+                )
+                continue
+
+            if att_type == "table" and att_data:
+                parts.append(f"<div class='table-block'>{att_data}</div>")
+                continue
+
+            if obj_type.startswith("heading"):
+                level = _heading_level_from_type(row.get("Object Type", "")) or 1
+                level = max(1, min(level, 3))
+                heading_text = text or "Heading"
+                parts.append(f"<h{level}>{html.escape(heading_text)}</h{level}>")
+                continue
+
+            if text:
+                parts.append(f"<p>{html.escape(text)}</p>")
+
+        parts.append("</div>")
+        return "".join(parts)
+
+    def _build_existing_front_page_html(self, source_name: str) -> None:
+        records = self.data_manager.get_front_matter_records(source_name)
+        if not records:
+            self._existing_front_page_html = ""
+            return
+        df = pd.DataFrame(records)
+        self._existing_front_page_html = self._render_front_rows_to_html(df)
+        self._existing_front_page_source = source_name
+
+    def preview_front_page_only(self) -> None:
+        """Open a modal dialog showing only the front-page preview for quick editing."""
+        src = self._current_source_name()
+        self._ensure_header_profile(src)
+        settings = self._get_header_settings(src)
+        if getattr(self, "_use_existing_front_page", False) and self._existing_front_page_html:
+            styles = self._front_page_base_styles()
+            html_front = f"<html><head>{styles}</head><body>{self._existing_front_page_html}</body></html>"
+        else:
+            html_front = self._compose_front_page_html(settings)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Front Page Preview")
+        dlg.resize(820, 640)
+        v = QVBoxLayout(dlg)
+        browser = QTextBrowser(dlg)
+        browser.setHtml(html_front)
+        v.addWidget(browser)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dlg)
+        bb.rejected.connect(dlg.reject)
+        bb.accepted.connect(dlg.accept)
+        v.addWidget(bb)
+        dlg.exec()
+
     # ------------------------------------------------------------------
     import re, html, json
     import pandas as pd
@@ -2459,20 +2817,51 @@ class MainWindow(QMainWindow):
             .table-block { text-align: center; margin: 16px 0; }
             .image-block { text-align: center; margin: 16px 0; }
             .caption { font-style: italic; font-size: 10pt; margin-top: 6px; text-align: center; }
+            .existing-front-page { border-style: dashed; }
         </style>
         """
+        wm_text = str(settings.get("watermark_text", "") or "").strip()
+        # Determine front page HTML
+        if getattr(self, "_use_existing_front_page", False) and getattr(self, "_existing_front_page_html", ""):
+            front_page_html = self._existing_front_page_html
+        else:
+            front_page_html = self._build_front_page_html(settings)
 
-        front_page_html = self._build_front_page_html(settings)
+        # Watermark overlay for preview (diagonal, gray, auto-size) — preview only
+        wm_text = str(settings.get("watermark_text", "") or "").strip()
+        wm_div = (
+            f"<div style='position:fixed;top:50%;left:50%;transform:translate(-50%, -50%) rotate(-35deg);"
+            f"color:#7F7F7F;opacity:0.25;font-family:Arial,sans-serif;font-weight:700;"
+            f"font-size:clamp(48px,12vw,160px);white-space:nowrap;z-index:9999;pointer-events:none;user-select:none;'>"
+            f"{html.escape(wm_text)}</div>"
+        ) if wm_text else ""
 
         if local_df.empty:
-            return f"<html><head>{styles}</head><body>{front_page_html}<p>No data loaded.</p></body></html>"
+            return f"<html><head>{styles}</head><body>{wm_div}{front_page_html}<p>No data loaded.</p></body></html>"
 
         toc_entries, figure_entries, table_entries = [], [], []
         body_parts: list[str] = []
         figure_count = table_count = 0
+        skip_indices: set[int] = set()
         section_col = getattr(self.data_manager, "section_column_name", "Section Number")
 
+        def _guess_caption(start_idx: int, kind: str) -> tuple[str, Optional[int]]:
+            limit = len(local_df)
+            for offset in range(start_idx + 1, min(limit, start_idx + 6)):
+                row_next = local_df.iloc[offset]
+                next_text = str(row_next.get("Object Text", "") or "").strip()
+                if not next_text:
+                    continue
+                lower = next_text.lower()
+                if kind == "figure" and lower.startswith("figure"):
+                    return next_text, offset
+                if kind == "table" and lower.startswith("table"):
+                    return next_text, offset
+            return "", None
+
         for idx, row in local_df.iterrows():
+            if idx in skip_indices:
+                continue
             global_idx = row.get("_global_index", idx)
             obj_type = str(row.get("Object Type", "")).strip()
             lower_type = obj_type.lower()
@@ -2504,7 +2893,14 @@ class MainWindow(QMainWindow):
             if attachment_type == "table" and attachment_data:
                 table_count += 1
                 table_id = f"table-{global_idx}"
-                caption_text = text or f"Table {table_count}"
+                caption_text = text or ""
+                caption_idx: Optional[int] = None
+                if not caption_text:
+                    caption_text, caption_idx = _guess_caption(idx, "table")
+                if caption_idx is not None:
+                    skip_indices.add(caption_idx)
+                if not caption_text:
+                    caption_text = f"Table {table_count}"
                 body_parts.append(f'<div id="{table_id}" class="table-block">{attachment_data}')
                 body_parts.append(f'<div class="caption">Table {table_count}: {html.escape(caption_text)}</div></div>')
                 table_entries.append({"id": table_id, "title": f"Table {table_count}: {caption_text}"})
@@ -2522,7 +2918,14 @@ class MainWindow(QMainWindow):
                 if not image_data:
                     continue
                 mime = payload.get("mime", "image/png")
-                caption_text = text or payload.get("filename", "") or f"Figure {figure_count}"
+                caption_text = text or payload.get("filename", "")
+                caption_idx: Optional[int] = None
+                if not caption_text:
+                    caption_text, caption_idx = _guess_caption(idx, "figure")
+                if caption_idx is not None:
+                    skip_indices.add(caption_idx)
+                if not caption_text:
+                    caption_text = f"Figure {figure_count}"
                 width_percent = settings.get("preview_image_width_percent", 80)
                 body_parts.append(
                     f'<div id="{figure_id}" class="image-block"><img src="data:{mime};base64,{image_data}" '
@@ -2612,7 +3015,7 @@ class MainWindow(QMainWindow):
 
         return (
             f"<html><head>{styles}</head><body>"
-            f"{front_page_html}"
+            f"{wm_div}{front_page_html}"
             '<div class="page-separator"></div>'
             f"{toc_html}{figures_html}{tables_html}{body_html}"
             "</body></html>"
@@ -2859,33 +3262,38 @@ class MainWindow(QMainWindow):
         from the active Excel tab's DataFrame. Also updates the navigation tree.
         """
         try:
-            tab = self._active_excel_tab()
-            if not tab or tab.df is None or tab.df.empty:
-                # Preserve old behavior if present, else show a user-facing note
+            df = None
+            tab = self._active_excel_tab() if hasattr(self, "_active_excel_tab") else None
+            if tab and getattr(tab, "df", None) is not None and not tab.df.empty:
+                df = tab.df.copy()
+            else:
+                # Fallback to current sourceÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢s dataframe (works for Word/Excel/manual tabs)
                 try:
-                    super().run_convert_preview()
+                    df = self._get_dataframe_for_source(raw=True)
                 except Exception:
-                    if hasattr(self, "log_console"):
-                        self.log_console("No Excel tab selected or tab is empty.")
-                return
+                    df = None
 
-            # Use the tab's dataframe (already finalized by the data manager)
-            df = tab.df.copy()
+            # Compose the HTML (use main composer)
+            html = self.compose_preview_html(df) if hasattr(self, "compose_preview_html") else ""
 
-            # Compose the HTML using the safer heading parsing (see helpers above)
-            html = self.compose_word_preview_html(df)
-
-            # Push to the preview widget
+            # Push to the preview widget and switch view
             if hasattr(self, "word_preview") and self.word_preview is not None:
-                self.word_preview.setHtml(html)
+                self.word_preview.setHtml(html or "")
+                if hasattr(self, "view_stack"):
+                    try:
+                        self.view_stack.setCurrentWidget(self.word_preview)
+                    except Exception:
+                        pass
             elif hasattr(self, "preview") and self.preview is not None:
-                self.preview.setHtml(html)
+                self.preview.setHtml(html or "")
 
-            # Rebuild Navigation based on the same df
+            # Rebuild Navigation based on the same df (best-effort)
             try:
-                self.populate_navigation(df)
+                if df is not None:
+                    self.populate_navigation(df)
+                else:
+                    self.populate_navigation()
             except Exception as nav_exc:
-                # Navigation failures should not block the preview
                 if hasattr(self, "log_console"):
                     self.log_console(f"Navigation build warning: {nav_exc}")
 
@@ -3004,7 +3412,7 @@ class MainWindow(QMainWindow):
 
                     if not row_maps:
                         QMessageBox.information(self, "Traceability Matrix",
-                                                "No cross‑tab trace links found between the selected tabs.")
+                                                "No crossÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Ëœtab trace links found between the selected tabs.")
                         return
 
                     columns = tab_ids
@@ -3573,56 +3981,110 @@ class MainWindow(QMainWindow):
 
 
     def _apply_watermark(self, document, text: str, parse_xml, nsdecls) -> None:
+        """Apply or update a diagonal semi-transparent watermark across all sections.
+
+        Settings per requirements:
+        - Font: Arial
+        - Layout: Diagonal (rotation 315)
+        - Color: Gray (semi-transparent)
+        - Size: Auto (scaled relative to page size)
+        """
         safe_text = (text or "").strip()
         if not safe_text:
             return
+        # escape and normalize quotes for inclusion inside attribute strings
         safe_text = html.escape(safe_text).replace('"', "'")
-        section = document.sections[0]
-        header = section.header
-        ns_v = "{urn:schemas-microsoft-com:vml}"
-        for shape in header._element.findall(f".//{ns_v}shape"):
-            if "PowerPlusWaterMarkObject" in (shape.get("id") or ""):
-                parent = shape.getparent()
-                if parent is not None:
-                    parent.remove(shape)
-        for shapetype in header._element.findall(f".//{ns_v}shapetype"):
-            if shapetype.get("id") == "_x0000_t136":
-                parent = shapetype.getparent()
-                if parent is not None:
-                    parent.remove(shapetype)
 
-        watermark_xml = (
-            '<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
-            'xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" '
-            'xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns:w10="urn:schemas-microsoft-com:office:word">'
-            "<w:r><w:pict>"
-            '<v:shapetype id="_x0000_t136" coordsize="21600,21600" o:spt="136" o:connecttype="custom" '
-            'path="m@7,l@8,m@5,21600l@6,21600e" filled="f" stroked="f">'
-            "<v:formulas>"
-            "<v:f eqn=\"if lineDrawn pixelLineWidth 0\"/>"
-            "<v:f eqn=\"sum @0 1 0\"/>"
-            "<v:f eqn=\"sum 0 0 @1\"/>"
-            "<v:f eqn=\"prod @2 1 2\"/>"
-            "<v:f eqn=\"prod @3 21600 pixelWidth\"/>"
-            "<v:f eqn=\"prod @3 21600 pixelHeight\"/>"
-            "<v:f eqn=\"sum @0 0 1\"/>"
-            "<v:f eqn=\"prod @6 1 2\"/>"
-            "<v:f eqn=\"prod @7 21600 pixelWidth\"/>"
-            "<v:f eqn=\"prod @7 21600 pixelHeight\"/>"
-            "</v:formulas>"
-            "<v:path o:extrusionok=\"f\" gradientshapeok=\"t\" o:connecttype=\"custom\" "
-            'connectlocs="@5,0;@6,21600;@8,0;@9,21600"/>'
-            "<o:lock v:ext=\"edit\" text=\"t\" shapetype=\"t\"/>"
-            "</v:shapetype>"
-            '<v:shape id="PowerPlusWaterMarkObject" o:spid="_x0000_s1025" type="#_x0000_t136" '
-            'style="position:absolute;margin-left:0;margin-top:0;width:468pt;height:468pt;rotation:315;z-index:-251658240;visibility:visible;mso-wrap-edited:f" '
-            'o:allowincell="f" fillcolor="gray" stroked="f">'
-            '<v:fill opacity="0.1" />'
-            f"<v:textpath style=\"font-family:'Calibri';font-size:48pt\" string=\"{safe_text}\"/>"
-            "</v:shape>"
-            "</w:pict></w:r></w:p>"
-        )
-        header._element.append(parse_xml(watermark_xml))
+        EMU_PER_INCH = 914400.0
+
+        # Helper to apply watermark to a given header (normal/first-page/even-page)
+        def _apply_to_header(hdr, width_in, height_in, font_size_pt):
+            # Remove existing shapes/paras
+            try:
+                for para in list(hdr.paragraphs):
+                    if "PowerPlusWaterMarkObject" in para._element.xml:
+                        hdr._element.remove(para._element)
+                ns_v = "{urn:schemas-microsoft-com:vml}"
+                for shape in hdr._element.findall(f".//{ns_v}shape"):
+                    if "PowerPlusWaterMarkObject" in (shape.get("id") or ""):
+                        parent = shape.getparent()
+                        if parent is not None:
+                            parent.remove(shape)
+                for shapetype in hdr._element.findall(f".//{ns_v}shapetype"):
+                    if shapetype.get("id") == "_x0000_t136":
+                        parent = shapetype.getparent()
+                        if parent is not None:
+                            parent.remove(shapetype)
+            except Exception:
+                pass
+
+            watermark_xml = f"""
+            <w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                 xmlns:v="urn:schemas-microsoft-com:vml"
+                 xmlns:o="urn:schemas-microsoft-com:office:office">
+                <w:r>
+                    <w:pict>
+                        <v:shapetype id="_x0000_t136" coordsize="21600,21600" o:spt="136" o:connecttype="custom"
+                                     path="m@7,l@8,m@5,21600l@6,21600e" filled="f" stroked="f">
+                            <v:formulas>
+                                <v:f eqn="if lineDrawn pixelLineWidth 0"/>
+                                <v:f eqn="sum @0 1 0"/>
+                                <v:f eqn="sum 0 0 @1"/>
+                                <v:f eqn="prod @2 1 2"/>
+                                <v:f eqn="prod @3 21600 pixelWidth"/>
+                                <v:f eqn="prod @3 21600 pixelHeight"/>
+                                <v:f eqn="sum @0 0 1"/>
+                                <v:f eqn="prod @6 1 2"/>
+                                <v:f eqn="prod @7 21600 pixelWidth"/>
+                                <v:f eqn="prod @7 21600 pixelHeight"/>
+                            </v:formulas>
+                            <v:path o:extrusionok="f" gradientshapeok="t" o:connecttype="custom"/>
+                            <o:lock v:ext="edit" text="t" shapetype="t"/>
+                        </v:shapetype>
+                        <v:shape id="PowerPlusWaterMarkObject" o:spid="_x0000_s1025" type="#_x0000_t136"
+                                 style="position:absolute; width:{width_in:.3f}in; height:{height_in:.3f}in; rotation:315;
+                                        mso-position-horizontal:center; mso-position-vertical:center;
+                                        mso-position-horizontal-relative:page; mso-position-vertical-relative:page;
+                                        z-index:-251658240; visibility:visible; mso-wrap-style:none;"
+                                 fillcolor="#7F7F7F" stroked="f" o:allowincell="f" o:allowoverlap="t">
+                            <v:fill color="#7F7F7F"/>
+                            <v:textpath style="font-family:&quot;Arial&quot;;font-size:{font_size_in:.2f}in" on="t" string="{safe_text}"/>
+                        </v:shape>
+                    </w:pict>
+                </w:r>
+            </w:p>
+            """
+            hdr._element.append(parse_xml(watermark_xml))
+
+        # Iterate every section to ensure watermark appears on all headers
+        for section in document.sections:
+            # Compute page-relative size (auto sizing)
+            try:
+                width_in = float(section.page_width) / EMU_PER_INCH
+                height_in = float(section.page_height) / EMU_PER_INCH
+            except Exception:
+                width_in, height_in = 8.5, 11.0
+
+            # Font size proportional to the page (min dimension)
+            try:
+                font_size_pt = max(48, int(min(width_in, height_in) * 72 * 0.11))
+            except Exception:
+                font_size_pt = 72
+            font_size_in = max(0.75, min(width_in, height_in) * 0.12)
+            font_size_in = max(0.75, min(width_in, height_in) * 0.12)
+
+            _apply_to_header(section.header, width_in, height_in, font_size_pt)
+            # Also cover first/odd-even variants if enabled
+            try:
+                if hasattr(section, "first_page_header") and section.first_page_header is not None:
+                    _apply_to_header(section.first_page_header, width_in, height_in, font_size_pt)
+            except Exception:
+                pass
+            try:
+                if hasattr(section, "even_page_header") and section.even_page_header is not None:
+                    _apply_to_header(section.even_page_header, width_in, height_in, font_size_pt)
+            except Exception:
+                pass
 
     def _append_seq_field(self, paragraph, label: str, RGBColor, OxmlElement, qn) -> None:
         run = paragraph.add_run()
@@ -3886,7 +4348,7 @@ class MainWindow(QMainWindow):
 
         # ---------------- Excel-like header menu & helpers ----------------
     def _open_header_menu_shortcut(self) -> None:
-        """Alt+Down at window scope → open current table's header menu for the active column."""
+        """Alt+Down at window scope ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ open current table's header menu for the active column."""
         table = self._current_table()
         if not table:
             return
@@ -4072,7 +4534,7 @@ class MainWindow(QMainWindow):
         self.populate_table()
 
     def _set_heading_level_shortcut(self, level: int) -> None:
-        """Alt+1/2/3 → set current row's object type to heading level."""
+        """Alt+1/2/3 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ set current row's object type to heading level."""
         table = self._current_table()
         if not table:
             return
@@ -4094,7 +4556,7 @@ class MainWindow(QMainWindow):
                 self.on_table_cell_changed(item)
 
     def _focus_excel_tab(self) -> None:
-        """Ctrl+E → focus the Excel (grid) tab and show the grid view."""
+        """Ctrl+E ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ focus the Excel (grid) tab and show the grid view."""
         # Prefer an explicit 'Excel' tab if present
         for idx in range(self.table_tabs.count()):
             w = self.table_tabs.widget(idx)
@@ -4113,7 +4575,7 @@ class MainWindow(QMainWindow):
             return
 
         match_row = self.search_matches.iloc[index]
-        # ← This is the original DataFrame index (global row id), perfect for anchors.
+        # ÃƒÂ¢Ã¢â‚¬Â Ã‚Â This is the original DataFrame index (global row id), perfect for anchors.
         global_index = int(match_row.name)
 
         rid = str(match_row.get("Requirement ID", "")).strip()
@@ -4258,7 +4720,7 @@ class MainWindow(QMainWindow):
             return
 
         self.log_console(f"Excel saved with embedded thumbnails: {file_name}")
-        QMessageBox.information(self, "Saved", f"✅ Excel saved:\n{file_name}")
+        QMessageBox.information(self, "Saved", f"Excel saved:\n{file_name}")
     
         
     def find_next_match(self):

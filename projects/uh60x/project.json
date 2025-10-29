@@ -1,0 +1,35 @@
+{
+    "name": "uh60x",
+    "last_modified": "2025-10-29T01:25:38.889181",
+    "word_files": [
+        "H398-002-001-ANA.docx"
+    ],
+    "word_pattern": {
+        "mode": "prefixes",
+        "value": ""
+    },
+    "header_profiles": {
+        "H398-002-001-ANA.docx": {
+            "document_title": "Software Requirements Specification for Gateway Module of EDAU in UH-60X Engine Instrument System",
+            "document_number": "MGT-H398-GWY-S001",
+            "revision": "2.4",
+            "author_name": "",
+            "author_title": "(Software Engineer)",
+            "reviewer_name": "",
+            "reviewer_title": "(Software Engineer)",
+            "qa_name": "Anitha K",
+            "qa_title": "(Quality Assurance Engineer)",
+            "config_manager_name": "Krishnamoorthy Duraiswamy",
+            "config_manager_title": "(Engineering Manager)",
+            "logo_left_path": "",
+            "logo_right_path": "",
+            "preview_image_width_percent": 80,
+            "export_image_width_inches": 5.5,
+            "address_howell": "Howell Instruments, Inc.<br/>8945 South Freeway<br/>Fort Worth, Texas, 76140<br/>U.S.A.",
+            "address_mach": "Mach Global Technologies<br/>No 42/4A, Shantipura Road, Electronic City,<br/>Phase 2, Bengaluru, Karnataka 560100, India",
+            "proprietary_notice": "This document and the information contained herein are the property of Howell Instruments, Inc. Any reproduction, disclosure or use thereof is prohibited except as authorized in writing by Howell Instruments, Inc. Recipient accepts the responsibility for maintaining the confidentiality of the contents of this document.",
+            "copyright_notice": "\u00a9 2025 Howell Instruments. All rights reserved.",
+            "watermark_text": ""
+        }
+    }
+}
