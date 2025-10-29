@@ -691,6 +691,16 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _on_home_clicked(self) -> None:
+        """Persist current project before navigating away via Home button."""
+        try:
+            self._save_project_state()
+        except Exception as e:
+            try:
+                self.log_console(f"Auto-save on Home failed: {e}")
+            except Exception:
+                pass
+
     def closeEvent(self, event) -> None:
         try:
             for t in list(getattr(self, "_bg_threads", [])):
@@ -1022,7 +1032,8 @@ class MainWindow(QMainWindow):
         # ÃƒÂ°Ã…Â¸Ã‚ÂÃ‚Â  Home button
         self.home_btn = QPushButton("Home")
         self.home_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.home_btn.clicked.connect(self.return_to_main_page)
+        # Save project state locally; MainApp also hooks this to switch the view
+        self.home_btn.clicked.connect(self._on_home_clicked)
         button_row.addWidget(self.home_btn)
         self.load_btn = QPushButton('Load Excel')
         self.load_btn.clicked.connect(self.load_excels)
@@ -5295,6 +5306,16 @@ class HeaderSettingsDialog(QDialog):
         h_layout.addWidget(line_edit)
         h_layout.addWidget(browse_btn)
         return container, line_edit
+
+    def _on_home_clicked(self) -> None:
+        """Persist current project before navigating away via Home button."""
+        try:
+            self._save_project_state()
+        except Exception as e:
+            try:
+                self.log_console(f"Auto-save on Home failed: {e}")
+            except Exception:
+                pass
 
     def _browse_for_logo(self, line_edit: QLineEdit) -> None:
         path, _ = QFileDialog.getOpenFileName(

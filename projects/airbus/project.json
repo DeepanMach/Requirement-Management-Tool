@@ -1,8 +1,8 @@
 {
     "name": "Airbus",
-    "last_modified": "2025-10-29T14:22:12.920074",
+    "last_modified": "2025-10-29T14:56:36.502357",
     "header_profiles": {
-        "__default__": {
+        "Excel": {
             "document_title": "Software Requirements Specification for Gateway Module of EDAU in UH-60X Engine Instrument System",
             "document_number": "MGT-H398-GWY-S001",
             "revision": "2.4",
@@ -31,5 +31,9 @@
     "word_pattern": {
         "mode": "prefixes",
         "value": ""
-    }
+    },
+    "excel_files": [
+        "Requirements1.xlsx",
+        "Requirements2.xlsx"
+    ]
 }

@@ -75,6 +75,12 @@ class MainApp(QMainWindow):
     def return_to_main_page(self):
         """Triggered by Home button to go back to MainFrontUI."""
         try:
+            # Best-effort: persist current project before navigating away
+            if hasattr(self, "main_window") and hasattr(self.main_window, "_save_project_state"):
+                try:
+                    self.main_window._save_project_state()
+                except Exception as e:
+                    print(f"[Warning] Auto-save before Home failed: {e}")
             self.stack.setCurrentWidget(self.main_front)
         except Exception as e:
             print(f"[Error] Failed to return to main page: {e}")
