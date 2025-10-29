@@ -458,7 +458,7 @@ class RequirementDataManager:
             or "list of tables" in lowered_text
         )
     # ------------------------------------------------------------------
-    def load_word_documents(self, paths: Iterable[str], progress_callback=None) -> pd.DataFrame:
+    def load_word_documents(self, paths: Iterable[str], progress_callback=None, *, interactive: bool = True) -> pd.DataFrame:
         """Load requirement data from one or more Word documents (.docx)."""
         try:
             from docx import Document  # type: ignore
@@ -490,7 +490,7 @@ class RequirementDataManager:
             extra_images = self.extract_all_images_from_docx(document, source_name=path.name, sheet_name=path.stem)
             if extra_images:
                 # de-dup by filename already present from paragraph-scan
-                existing_names = set()
+                existing_names: set[str] = set()
                 for r in records:
                     if r.get("Attachment Type", "").lower() == "image":
                         try:
@@ -500,9 +500,32 @@ class RequirementDataManager:
                                 existing_names.add(name)
                         except Exception:
                             pass
-                dedup = [img for img in extra_images
-                         if img.get("Attachment Type", "").lower() == "image"
-                         and self._safe_payload_name(img.get("Attachment Data", "")) not in existing_names]
+
+                # exclude images that were part of front-matter when that content is skipped
+                front_image_names: set[str] = set()
+                if getattr(self, "skip_front_matter_for_word", False):
+                    try:
+                        for fr in self.get_front_matter_records(path.name):
+                            if str(fr.get("Attachment Type", "")).lower() == "image":
+                                nm = self._safe_payload_name(fr.get("Attachment Data", ""))
+                                if nm:
+                                    front_image_names.add(nm)
+                    except Exception:
+                        pass
+
+                def include_pkg_image(img: dict[str, str]) -> bool:
+                    if str(img.get("Attachment Type", "")).lower() != "image":
+                        return False
+                    nm = self._safe_payload_name(img.get("Attachment Data", ""))
+                    if not nm:
+                        return False
+                    if nm in existing_names:
+                        return False
+                    if nm in front_image_names:
+                        return False
+                    return True
+
+                dedup = [img for img in extra_images if include_pkg_image(img)]
                 if dedup:
                     LOGGER.info("Added %d more image(s) from package sweep", len(dedup))
                     records.extend(dedup)
@@ -522,20 +545,23 @@ class RequirementDataManager:
         LOGGER.info("Total detected requirements: %d", req_count)
 
         # Ask user for Trace Direction (Up, Down, Bi-Directional)
-        try:
-            from PyQt6.QtWidgets import QInputDialog
-            direction, ok = QInputDialog.getItem(
-                None,
-                "Trace Direction",
-                f"{req_count} requirements found.\nSelect traceability direction:",
-                ["Up Trace", "Down Trace", "Bi-Directional"],
-                2,  # default to Bi-Directional
-                False,
-            )
-        except Exception:
-            LOGGER.warning("PyQt not available for trace direction prompt; defaulting to Bi-Directional.")
-            direction = "Bi-Directional"
-            ok = True
+        direction = "Bi-Directional"
+        ok = True
+        if interactive:
+            try:
+                from PyQt6.QtWidgets import QInputDialog
+                direction, ok = QInputDialog.getItem(
+                    None,
+                    "Trace Direction",
+                    f"{req_count} requirements found.\nSelect traceability direction:",
+                    ["Up Trace", "Down Trace", "Bi-Directional"],
+                    2,  # default to Bi-Directional
+                    False,
+                )
+            except Exception:
+                LOGGER.warning("PyQt not available for trace direction prompt; defaulting to Bi-Directional.")
+                direction = "Bi-Directional"
+                ok = True
 
         if not ok:
             direction = "Bi-Directional"
@@ -795,6 +821,16 @@ class RequirementDataManager:
         return self.dataframe
 
     # ------------------------------------------------------------------
+    def create_empty_dataframe(self) -> pd.DataFrame:
+        """Return a canonical empty dataframe used to initialize the UI/state.
+
+        Includes the default visible columns; downstream operations will
+        add the section column and any missing optional columns as needed.
+        """
+        cols = list(self.DEFAULT_COLUMN_ORDER)
+        return pd.DataFrame(columns=cols)
+
+    # ------------------------------------------------------------------
     def _extract_records_from_document(self, document, source_name: str, sheet_name: str, progress_callback=None) -> List[dict[str, str]]:
         """Extract requirement data, headings, text, tables, and images (from paragraphs) from a DOCX file."""
         from docx.table import Table  # type: ignore
@@ -1016,36 +1052,38 @@ class RequirementDataManager:
 
     # ------------------------------------------------------------------
     def _paragraph_has_image(self, paragraph) -> bool:
-        """Detect inline and floating images inside a paragraph."""
-        ns = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
-        blip_tag = f"{ns}blip"
-        drawing_tag = f"{ns}drawing"
+        """Detect inline/floating images, including legacy VML, inside a paragraph."""
+        a_ns = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+        vml_ns = "{urn:schemas-microsoft-com:vml}"
         for run in paragraph.runs:
-            if run._element.findall(f".//{blip_tag}"):
+            el = run._element
+            if el.findall(f".//{a_ns}blip") or el.findall(f".//{a_ns}drawing"):
                 return True
-            if run._element.findall(f".//{drawing_tag}"):
+            # Legacy VML image data
+            if el.findall(f".//{vml_ns}imagedata"):
                 return True
         return False
 
     # ------------------------------------------------------------------
     def _collect_paragraph_images(self, paragraph, source_name: str, sheet_name: str) -> List[dict[str, str]]:
-        """Extract images (inline or floating) from a paragraph."""
+        """Extract images (inline, floating, or legacy VML) from a paragraph."""
         from docx.oxml.ns import qn  # type: ignore
 
         records: List[dict[str, str]] = []
         seen: set[str] = set()
+        el = None
 
         for run in paragraph.runs:
-            for blip in run._element.findall(".//{http://schemas.openxmlformats.org/drawingml/2006/main}blip"):
+            el = run._element
+            # DrawingML images
+            for blip in el.findall(".//{http://schemas.openxmlformats.org/drawingml/2006/main}blip"):
                 rel_id = blip.get(qn("r:embed"))
                 if not rel_id or rel_id in seen:
                     continue
                 seen.add(rel_id)
-
                 part = paragraph.part.related_parts.get(rel_id)
                 if not part:
                     continue
-
                 mime = getattr(part, "content_type", "image/png")
                 filename = Path(str(part.partname)).name
                 payload = json.dumps({
@@ -1053,7 +1091,34 @@ class RequirementDataManager:
                     "data": base64.b64encode(part.blob).decode("ascii"),
                     "filename": filename,
                 })
+                records.append({
+                    "Object Type": "Image",
+                    "Requirement ID": "",
+                    "Object Text": filename,
+                    "Up Trace": "",
+                    "SourceFile": source_name,
+                    "SheetName": sheet_name,
+                    "SourceType": "docx",
+                    "Attachment Type": "image",
+                    "Attachment Data": payload,
+                })
 
+            # Legacy VML images (v:imagedata r:id="..." )
+            for imdata in el.findall(".//{urn:schemas-microsoft-com:vml}imagedata"):
+                rel_id = imdata.get(qn("r:id")) or imdata.get(qn("r:embed"))
+                if not rel_id or rel_id in seen:
+                    continue
+                seen.add(rel_id)
+                part = paragraph.part.related_parts.get(rel_id)
+                if not part:
+                    continue
+                mime = getattr(part, "content_type", "image/png")
+                filename = Path(str(part.partname)).name
+                payload = json.dumps({
+                    "mime": mime,
+                    "data": base64.b64encode(part.blob).decode("ascii"),
+                    "filename": filename,
+                })
                 records.append({
                     "Object Type": "Image",
                     "Requirement ID": "",

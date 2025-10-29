@@ -12,11 +12,12 @@ import os, shutil
 import logging
 import mimetypes
 from pathlib import Path
+import sys
 from typing import Dict, Optional, Sequence
 import time
 import datetime
 import pandas as pd
-from PyQt6.QtCore import Qt, QTimer, QPoint
+from PyQt6.QtCore import Qt, QTimer, QPoint, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QKeySequence, QPixmap, QShortcut, QTextCursor, QTextDocument, QTextCharFormat, QColor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -104,15 +105,25 @@ def canonical_projects_root(file_path: str | Path) -> Path:
     Always return the OUTER `<.../Requirement-Management-Tool>/projects` folder,
     even if this file lives under the inner `<.../Requirement-Management-Tool/Requirement-Management-Tool/...>`.
     """
-    here = Path(file_path).resolve()
-    outer = None
-    for p in here.parents:
-        if p.name == "Requirement-Management-Tool":
-            outer = p  # this will end up the *highest* one
-    if outer is None:
-        # Fallback if the folder name is different on your machine
-        outer = here.parents[2]
-    root = (outer / "projects").resolve()
+    # In frozen apps, prefer a user-writable location (LOCALAPPDATA on Windows)
+    if getattr(sys, "frozen", False):
+        if os.name == "nt":
+            base = os.environ.get("LOCALAPPDATA") or os.path.join(Path.home(), "AppData", "Local")
+            root = Path(base) / "Requirement-Management-Tool" / "projects"
+        else:
+            base = os.environ.get("XDG_DATA_HOME") or os.path.join(Path.home(), ".local", "share")
+            root = Path(base) / "Requirement-Management-Tool" / "projects"
+        root = root.resolve()
+    else:
+        here = Path(file_path).resolve()
+        outer = None
+        for p in here.parents:
+            if p.name == "Requirement-Management-Tool":
+                outer = p  # this will end up the *highest* one
+        if outer is None:
+            # Fallback if the folder name is different on your machine
+            outer = here.parents[2]
+        root = (outer / "projects").resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -349,6 +360,141 @@ class LoadingDialog(QDialog):
             layout.addWidget(label)
             layout.addWidget(bar)
 
+class RestoreWorker(QThread):
+    """Background worker to restore a project without freezing the UI.
+
+    Emits:
+      - progress(int, str): percentage and label text
+      - result(dict): contains optional 'excel_df', 'word_df', 'total_reqs'
+      - error(str): error message
+    """
+    progress = pyqtSignal(int, str)
+    result = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, excel_files: list[str], word_files: list[str], word_pattern: dict | None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._excel_files = [str(p) for p in (excel_files or []) if p]
+        self._word_files = [str(p) for p in (word_files or []) if p]
+        self._word_pattern = word_pattern or {}
+
+    def run(self):
+        from requirement_tool.data_manager import RequirementDataManager
+        import pandas as pd
+        try:
+            mgr = RequirementDataManager()
+            out: dict = {"excel_df": None, "word_df": None, "total_reqs": 0}
+
+            total_steps = (1 if self._excel_files else 0) + (len(self._word_files) if self._word_files else 0)
+            total_steps = max(total_steps, 1)
+            completed = 0
+
+            # Excel load
+            if self._excel_files:
+                self.progress.emit(int(completed / total_steps * 100), "Loading Excel files...")
+                excel_df = mgr.load_workbooks(self._excel_files)
+                out["excel_df"] = excel_df
+                completed += 1
+                self.progress.emit(int(completed / total_steps * 100), "Excel loaded")
+
+            # Word load
+            if self._word_files:
+                mgr.configure_requirement_pattern(self._word_pattern)
+                all_dfs = []
+                total_reqs = 0
+                for path in self._word_files:
+                    if self.isInterruptionRequested():
+                        break
+                    label = f"Parsing {Path(path).name}..."
+                    self.progress.emit(int(completed / total_steps * 100), label)
+
+                    def update_progress(pct: int):
+                        pct = max(0, min(100, int(pct)))
+                        base = 0 if total_steps == 0 else int(completed / total_steps * 100)
+                        self.progress.emit(base, f"{label} {pct}%")
+
+                    df_part = mgr.load_word_documents([path], progress_callback=update_progress, interactive=False)
+                    all_dfs.append(df_part)
+                    total_reqs += df_part["Object Type"].str.lower().eq("requirement").sum()
+                    completed += 1
+                    self.progress.emit(int(completed / total_steps * 100), f"Parsed {Path(path).name}")
+
+                if all_dfs:
+                    out["word_df"] = pd.concat(all_dfs, ignore_index=True)
+                    out["total_reqs"] = int(total_reqs)
+
+            self.result.emit(out)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class ImportWorker(QThread):
+    """Background loader for explicit Excel/Word imports.
+
+    Params:
+      - excel_files: list[str]
+      - word_files: list[str]
+      - word_pattern: dict | None
+    Emits:
+      - progress(int, str)
+      - result(dict)
+      - error(str)
+    """
+    progress = pyqtSignal(int, str)
+    result = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, excel_files: list[str] | None = None, word_files: list[str] | None = None, word_pattern: dict | None = None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._excel_files = [str(p) for p in (excel_files or []) if p]
+        self._word_files = [str(p) for p in (word_files or []) if p]
+        self._word_pattern = word_pattern or {}
+
+    def run(self):
+        from requirement_tool.data_manager import RequirementDataManager
+        import pandas as pd
+        try:
+            mgr = RequirementDataManager()
+            out: dict = {"excel_df": None, "word_df": None, "total_reqs": 0}
+            total_steps = (1 if self._excel_files else 0) + (len(self._word_files) if self._word_files else 0)
+            total_steps = max(total_steps, 1)
+            completed = 0
+
+            if self._excel_files:
+                self.progress.emit(int(completed / total_steps * 100), "Loading Excel files...")
+                out["excel_df"] = mgr.load_workbooks(self._excel_files)
+                completed += 1
+                self.progress.emit(int(completed / total_steps * 100), "Excel loaded")
+
+            if self._word_files:
+                mgr.configure_requirement_pattern(self._word_pattern)
+                all_dfs = []
+                total_reqs = 0
+                for path in self._word_files:
+                    if self.isInterruptionRequested():
+                        break
+                    label = f"Parsing {Path(path).name}..."
+                    self.progress.emit(int(completed / total_steps * 100), label)
+
+                    def update_progress(pct: int):
+                        pct = max(0, min(100, int(pct)))
+                        base = 0 if total_steps == 0 else int(completed / total_steps * 100)
+                        self.progress.emit(base, f"{label} {pct}%")
+
+                    df_part = mgr.load_word_documents([path], progress_callback=update_progress, interactive=False)
+                    all_dfs.append(df_part)
+                    total_reqs += df_part["Object Type"].str.lower().eq("requirement").sum()
+                    completed += 1
+                    self.progress.emit(int(completed / total_steps * 100), f"Parsed {Path(path).name}")
+
+                if all_dfs:
+                    out["word_df"] = pd.concat(all_dfs, ignore_index=True)
+                    out["total_reqs"] = int(total_reqs)
+
+            self.result.emit(out)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
 # >>> ADD: a self-contained Excel tab that shows an editable table + can build HTML preview
 class ExcelTab(QWidget):
     """
@@ -512,6 +658,57 @@ class ExcelTab(QWidget):
 
 
 class MainWindow(QMainWindow):
+
+    # ---- Thread helpers ----
+    def _track_thread(self, t: QThread) -> None:
+        if not hasattr(self, "_bg_threads"):
+            self._bg_threads: list[QThread] = []
+        self._bg_threads.append(t)
+        try:
+            t.finished.connect(lambda: self._bg_threads.remove(t) if t in getattr(self, "_bg_threads", []) else None)
+        except Exception:
+            pass
+
+    def _cancel_thread(self, t: QThread, progress: QProgressDialog | None = None) -> None:
+        try:
+            t.requestInterruption()
+        except Exception:
+            pass
+        # Wait briefly for clean exit; terminate only if still running
+        try:
+            t.wait(2000)
+        except Exception:
+            pass
+        try:
+            # Guard against already-deleted C++ object
+            if hasattr(t, 'isRunning') and t.isRunning():
+                t.terminate()
+        except Exception:
+            pass
+        if progress is not None:
+            try:
+                progress.close()
+            except Exception:
+                pass
+
+    def closeEvent(self, event) -> None:
+        try:
+            for t in list(getattr(self, "_bg_threads", [])):
+                try:
+                    t.requestInterruption()
+                except Exception:
+                    pass
+            for t in list(getattr(self, "_bg_threads", [])):
+                try:
+                    t.wait(2000)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            super().closeEvent(event)
+        except Exception:
+            pass
 
     def _projects_root(self) -> Path:
         """<repo>/projects regardless of CWD (matches Main_page)."""
@@ -682,36 +879,64 @@ class MainWindow(QMainWindow):
                 word_pattern = meta.get("word_pattern") or None
                 header_profiles = meta.get("header_profiles")
 
-                loading = LoadingDialog(f"Restoring project '{self.project_name}'...", self)
-                loading.setWindowModality(Qt.WindowModality.ApplicationModal)
-                loading.show()
-                QApplication.processEvents()  # force render now
+                # Threaded restore with visible progress (keeps UI responsive)
+                progress = QProgressDialog(f"Restoring project '{self.project_name}'...", None, 0, 100, self)
+                progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+                progress.setMinimumDuration(0)
+                progress.setAutoClose(False)
+                progress.setAutoReset(False)
+                progress.setValue(0)
+                QApplication.processEvents()
 
-                def _delayed_restore():
+                excel_existing = [p for p in excel_files if Path(p).exists()]
+                word_existing = [p for p in word_files if Path(p).exists()]
+                pattern = word_pattern  # do not prompt during automatic restore
+
+                worker = RestoreWorker(excel_existing, word_existing, pattern, parent=self)
+
+                def on_progress(pct: int | None, label: str):
+                    if label:
+                        progress.setLabelText(label)
+                    if isinstance(pct, int):
+                        progress.setValue(max(0, min(100, pct)))
+                    QApplication.processEvents()
+
+                def on_result(payload: dict):
                     try:
-                        excel_existing = [p for p in excel_files if Path(p).exists()]
-                        if excel_existing:
-                            self._import_excel_files(excel_existing)
+                        if payload.get("excel_df") is not None:
+                            self.data_manager.dataframe = self.data_manager.merge_new_dataframe(payload["excel_df"])
                             self.log_console(f"Restored {len(excel_existing)} Excel files.")
-
-                        word_existing = [p for p in word_files if Path(p).exists()]
-                        if word_existing:
-                            pattern = word_pattern or self._prompt_requirement_pattern()
-                            if pattern:
-                                self._import_word_files(word_existing, pattern)
-                                self.log_console(f"Restored {len(word_existing)} Word files.")
-
+                        if payload.get("word_df") is not None:
+                            self.data_manager.dataframe = self.data_manager.merge_new_dataframe(payload["word_df"])
+                            self.log_console(f"Restored {len(word_existing)} Word files.")
                         if header_profiles:
                             self.header_profiles = header_profiles
-
+                        self._undo_stack = [self.data_manager.dataframe.copy()]
+                        self.populate_table()
+                        self._save_project_state()
                         self.log_console("Project restore complete.")
                     except Exception as e:
-                        self.log_console(f"Delayed restore failed: {e}")
+                        self.log_console(f"Restore apply failed: {e}")
                     finally:
-                        loading.close()
+                        progress.close()
 
-                # Schedule restore slightly later so popup remains visible
-                QTimer.singleShot(200, _delayed_restore)
+                def on_error(msg: str):
+                    try:
+                        self.log_console(f"Restore failed: {msg}")
+                    finally:
+                        progress.close()
+
+                worker.progress.connect(on_progress)
+                worker.result.connect(on_result)
+                worker.error.connect(on_error)
+                # track worker to prevent premature GC and allow graceful shutdown
+                self._track_thread(worker)
+                # allow user to cancel
+                try:
+                    progress.canceled.connect(lambda: self._cancel_thread(worker, progress))
+                except Exception:
+                    pass
+                worker.start()
                 return
 
             # 3) Nothing to restore ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ start clean (prevents cross-project bleed)
@@ -1564,17 +1789,49 @@ class MainWindow(QMainWindow):
         normalized = [str(Path(path)) for path in files if path]
         if not normalized:
             return
+        progress = QProgressDialog("Loading Excel files...", None, 0, 100, self)
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        QApplication.processEvents()
+
+        worker = ImportWorker(excel_files=normalized, parent=self)
+
+        def on_progress(pct: int, label: str):
+            if label:
+                progress.setLabelText(label)
+            progress.setValue(max(0, min(100, int(pct))))
+            QApplication.processEvents()
+
+        def on_result(payload: dict):
+            try:
+                new_df = payload.get("excel_df")
+                if new_df is not None:
+                    df = self.data_manager.merge_new_dataframe(new_df)
+                    self._ensure_header_profile("Excel")
+                    self._undo_stack = [df.copy()]
+                    self.populate_table()
+                    self.log_console("Excel files loaded and numbering applied.")
+            finally:
+                progress.close()
+
+        def on_error(msg: str):
+            try:
+                QMessageBox.critical(self, "Load Error", msg)
+            finally:
+                progress.close()
+
+        worker.progress.connect(on_progress)
+        worker.result.connect(on_result)
+        worker.error.connect(on_error)
+        self._track_thread(worker)
         try:
-            new_df = self.data_manager.load_workbooks(normalized)
-        except RequirementDataError as exc:
-            LOGGER.exception("Failed to load workbooks")
-            QMessageBox.critical(self, "Load Error", str(exc))
-            return
-        df = self.data_manager.merge_new_dataframe(new_df)
-        self._ensure_header_profile("Excel")
-        self._undo_stack = [df.copy()]
-        self.populate_table()
-        self.log_console("Excel files loaded and numbering applied.")
+            progress.canceled.connect(lambda: self._cancel_thread(worker, progress))
+        except Exception:
+            pass
+        worker.start()
 
     # ------------------------------------------------------------------
     def _prompt_requirement_pattern(self) -> Optional[dict[str, str]]:
@@ -1609,114 +1866,109 @@ class MainWindow(QMainWindow):
         progress.setAutoClose(False)
         progress.setAutoReset(False)
         progress.setValue(0)
-
         QApplication.processEvents()
 
+        front_page_source = ""
         try:
-            total_files = len(normalized)
-            all_dfs = []
-            total_reqs = 0
-
-            front_page_source = ""
-            try:
-                from PyQt6.QtWidgets import QInputDialog
-                prompt_title = "Front Page Handling"
-                prompt_label = "Front page import:"  # applies to Word -> table import
-                options = [
-                    "Keep existing front page (do not import first page)",
-                    "Reset to default front page",
-                    "Clear all front page data",
-                ]
-                choice, ok = QInputDialog.getItem(self, prompt_title, prompt_label, options, 0, False)
-                if ok:
-                    if choice.startswith("Keep existing"):
-                        self._use_existing_front_page = True
-                        self.data_manager.skip_front_matter_for_word = True
-                        if normalized:
-                            front_page_source = Path(normalized[0]).name
-                            try:
-                                self._populate_header_from_docx(normalized[0])
-                            except Exception:
-                                pass
-                    elif choice.startswith("Reset to default"):
-                        self._use_existing_front_page = False
-                        self._existing_front_page_html = ""
-                        self._existing_front_page_source = ""
-                        src = self._current_source_name()
-                        self.header_profiles[self._header_key(src)] = copy.deepcopy(self.default_header_settings)
-                        self.data_manager.skip_front_matter_for_word = True
-                    elif choice.startswith("Clear all"):
-                        self._use_existing_front_page = False
-                        self._existing_front_page_html = ""
-                        self._existing_front_page_source = ""
-                        src = self._current_source_name()
-                        cleared = {k: ("" if isinstance(v, str) else v) for k, v in self.default_header_settings.items()}
-                        self.header_profiles[self._header_key(src)] = cleared
-                        self.data_manager.skip_front_matter_for_word = True
-                    else:
-                        self.data_manager.skip_front_matter_for_word = True
+            from PyQt6.QtWidgets import QInputDialog
+            prompt_title = "Front Page Handling"
+            prompt_label = "Front page import:"  # applies to Word -> table import
+            options = [
+                "Keep existing front page (do not import first page)",
+                "Reset to default front page",
+                "Clear all front page data",
+            ]
+            choice, ok = QInputDialog.getItem(self, prompt_title, prompt_label, options, 0, False)
+            if ok:
+                if choice.startswith("Keep existing"):
+                    self._use_existing_front_page = True
+                    self.data_manager.skip_front_matter_for_word = True
+                    if normalized:
+                        front_page_source = Path(normalized[0]).name
+                        try:
+                            self._populate_header_from_docx(normalized[0])
+                        except Exception:
+                            pass
+                elif choice.startswith("Reset to default"):
+                    self._use_existing_front_page = False
+                    self._existing_front_page_html = ""
+                    self._existing_front_page_source = ""
+                    src = self._current_source_name()
+                    self.header_profiles[self._header_key(src)] = copy.deepcopy(self.default_header_settings)
+                    self.data_manager.skip_front_matter_for_word = True
+                elif choice.startswith("Clear all"):
+                    self._use_existing_front_page = False
+                    self._existing_front_page_html = ""
+                    self._existing_front_page_source = ""
+                    src = self._current_source_name()
+                    cleared = {k: ("" if isinstance(v, str) else v) for k, v in self.default_header_settings.items()}
+                    self.header_profiles[self._header_key(src)] = cleared
+                    self.data_manager.skip_front_matter_for_word = True
                 else:
                     self.data_manager.skip_front_matter_for_word = True
-            except Exception:
+            else:
                 self.data_manager.skip_front_matter_for_word = True
+        except Exception:
+            self.data_manager.skip_front_matter_for_word = True
 
-            if self._use_existing_front_page and not front_page_source and normalized:
-                front_page_source = Path(normalized[0]).name
-            self._existing_front_page_source = front_page_source
+        if self._use_existing_front_page and not front_page_source and normalized:
+            front_page_source = Path(normalized[0]).name
+        self._existing_front_page_source = front_page_source
 
-            for i, path in enumerate(normalized, 1):
-                progress.setLabelText(f"Extracting from: {Path(path).name}")
-                progress.setValue(0)
-                QApplication.processEvents()
+        worker = ImportWorker(word_files=normalized, word_pattern=cfg, parent=self)
 
-                def update_progress(pct):
-                    progress.setLabelText(f"Loading {Path(path).name}... {pct}%")
-                    progress.setValue(pct)
-                    QApplication.processEvents()
-
-                new_df = self.data_manager.load_word_documents([path], progress_callback=update_progress)
-                all_dfs.append(new_df)
-
-                if self._use_existing_front_page and not self._existing_front_page_source:
-                    self._existing_front_page_source = Path(path).name
-
-                req_count = new_df["Object Type"].str.lower().eq("requirement").sum()
-                total_reqs += req_count
-
-            if self._use_existing_front_page and self._existing_front_page_source:
-                try:
-                    self._build_existing_front_page_html(self._existing_front_page_source)
-                except Exception:
-                    self._existing_front_page_html = ""
-            if self._use_existing_front_page and not self._existing_front_page_html:
-                self._use_existing_front_page = False
-                self.log_console("Existing front page could not be extracted; using template instead.")
-
-            df = pd.concat(all_dfs, ignore_index=True)
-            df = self.data_manager.merge_new_dataframe(df)
-            self._undo_stack = [df.copy()]
-
-            progress.setLabelText("Finalizing traceability...")
-            progress.setValue(100)
+        def on_progress(pct: int, label: str):
+            if label:
+                progress.setLabelText(label)
+            progress.setValue(max(0, min(100, int(pct))))
             QApplication.processEvents()
 
-            self.populate_table()
-
-            QMessageBox.information(
-                self,
-                "Requirements Loaded",
-                f"{total_reqs} requirements loaded successfully."
-            )
-
-        except RequirementDataError as exc:
-            LOGGER.exception("Failed to load Word documents")
-            QMessageBox.critical(self, "Load Error", str(exc))
-        finally:
+        def on_result(payload: dict):
             try:
-                self.data_manager.skip_front_matter_for_word = False
-            except Exception:
-                pass
-            progress.close()
+                all_df = payload.get("word_df")
+                total_reqs = payload.get("total_reqs", 0)
+                if all_df is not None:
+                    # Handle front page post-processing if requested earlier
+                    if self._use_existing_front_page and not self._existing_front_page_source and normalized:
+                        self._existing_front_page_source = Path(normalized[0]).name
+                    if self._use_existing_front_page and self._existing_front_page_source:
+                        try:
+                            self._build_existing_front_page_html(self._existing_front_page_source)
+                        except Exception:
+                            self._existing_front_page_html = ""
+                    if self._use_existing_front_page and not self._existing_front_page_html:
+                        self._use_existing_front_page = False
+                        self.log_console("Existing front page could not be extracted; using template instead.")
+
+                    df = self.data_manager.merge_new_dataframe(all_df)
+                    self._undo_stack = [df.copy()]
+                    self.populate_table()
+                    QMessageBox.information(self, "Requirements Loaded", f"{total_reqs} requirements loaded successfully.")
+            except RequirementDataError as exc:
+                LOGGER.exception("Failed to load Word documents")
+                QMessageBox.critical(self, "Load Error", str(exc))
+            finally:
+                try:
+                    self.data_manager.skip_front_matter_for_word = False
+                except Exception:
+                    pass
+                progress.close()
+
+        def on_error(msg: str):
+            try:
+                QMessageBox.critical(self, "Load Error", msg)
+            finally:
+                progress.close()
+
+        worker.progress.connect(on_progress)
+        worker.result.connect(on_result)
+        worker.error.connect(on_error)
+        self._track_thread(worker)
+        try:
+            progress.canceled.connect(lambda: self._cancel_thread(worker, progress))
+        except Exception:
+            pass
+        worker.start()
 
 
 
@@ -1857,7 +2109,11 @@ class MainWindow(QMainWindow):
             self.table_tabs.addTab(placeholder, "No Data")
             self.table_tabs.blockSignals(False)
             self._loading = False
-            self.view_stack.setCurrentWidget(self.table_tabs) if self.project_name else self.view_stack.setCurrentWidget(self.front_page)
+            # Only switch if widget is part of the stack to avoid warnings
+            if self.project_name and self.view_stack.indexOf(self.table_tabs) != -1:
+                self.view_stack.setCurrentWidget(self.table_tabs)
+            elif self.view_stack.indexOf(self.front_page) != -1:
+                self.view_stack.setCurrentWidget(self.front_page)
             self.populate_navigation()
             return
 
@@ -1900,6 +2156,20 @@ class MainWindow(QMainWindow):
             self.populate_navigation()
             return
 
+        # Prepare progress dialog for large datasets
+        total_rows = int(len(df))
+        use_progress = total_rows > 1000
+        progress = None
+        processed_rows = 0
+        if use_progress:
+            progress = QProgressDialog("Building table...", None, 0, total_rows, self)
+            progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+            progress.setMinimumDuration(0)
+            progress.setAutoClose(True)
+            progress.setAutoReset(True)
+            progress.setValue(0)
+            QApplication.processEvents()
+
         for source_name, group, source_type in tab_groups:
             table = self._create_table_widget()
             table.setProperty("source", source_name)
@@ -1932,6 +2202,8 @@ class MainWindow(QMainWindow):
             self._tab_source_types[source_name] = source_type
             self._ensure_header_profile(source_name)
 
+            # Disable updates while filling for performance
+            table.setUpdatesEnabled(False)
             for display_row, (df_index, row) in enumerate(display_df.iterrows()):
                 is_heading = "heading" in str(row.get("Object Type", "")).lower()
                 for column_index, column_name in enumerate(base_columns):
@@ -1992,13 +2264,35 @@ class MainWindow(QMainWindow):
                     )
                     item.setData(Qt.ItemDataRole.UserRole, df_index)
                     table.setItem(display_row, column_index, item)
-            table.resizeColumnsToContents()
-            table.resizeRowsToContents()
+
+                processed_rows += 1
+                if use_progress and (processed_rows % 200 == 0):
+                    try:
+                        progress.setValue(min(processed_rows, total_rows))
+                        QApplication.processEvents()
+                    except Exception:
+                        pass
+
+            # Re-enable updates and do lightweight sizing
+            table.setUpdatesEnabled(True)
+            if total_rows <= 3000:
+                try:
+                    table.resizeColumnsToContents()
+                    table.resizeRowsToContents()
+                except Exception:
+                    pass
             self.table_tabs.addTab(table, source_name)
 
+        if use_progress and progress is not None:
+            try:
+                progress.setValue(total_rows)
+                QApplication.processEvents()
+            except Exception:
+                pass
         self.table_tabs.blockSignals(False)
         self._loading = False
-        self.view_stack.setCurrentWidget(self.table_tabs)
+        if self.view_stack.indexOf(self.table_tabs) != -1:
+            self.view_stack.setCurrentWidget(self.table_tabs)
         self._ensure_header_profile(self._current_source_name())
         self.log_console("Table populated with Excel-style formatting.")
         self.populate_navigation()
@@ -3770,7 +4064,7 @@ class MainWindow(QMainWindow):
         """
         Adds an 'Up Trace' or 'Down Trace' column dynamically when the user requests tracing.
         """
-        from PyQt5.QtWidgets import QInputDialog
+        from PyQt6.QtWidgets import QInputDialog
 
         direction, ok = QInputDialog.getItem(
             self,

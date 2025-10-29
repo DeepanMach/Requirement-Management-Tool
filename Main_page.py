@@ -13,20 +13,39 @@ YELLOW = "#66b2ff"
 
 from pathlib import Path
 
+def resource_path(relative: str) -> str:
+    """Return an absolute path to a bundled resource.
+
+    - In a PyInstaller frozen app, resources are under `sys._MEIPASS`.
+    - In dev mode, resolve relative to the repo root (this file's parent).
+    """
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
+
 def canonical_projects_root(file_path: str | Path) -> Path:
     """
     Always return the OUTER `<.../Requirement-Management-Tool>/projects` folder,
     even if this file lives under the inner `<.../Requirement-Management-Tool/Requirement-Management-Tool/...>`.
     """
-    here = Path(file_path).resolve()
-    outer = None
-    for p in here.parents:
-        if p.name == "Requirement-Management-Tool":
-            outer = p  # this will end up the *highest* one
-    if outer is None:
-        # Fallback if the folder name is different on your machine
-        outer = here.parents[2]
-    root = (outer / "projects").resolve()
+    # In frozen apps, prefer a user-writable location (LOCALAPPDATA on Windows)
+    if getattr(sys, "frozen", False):
+        if os.name == "nt":
+            base = os.environ.get("LOCALAPPDATA") or os.path.join(Path.home(), "AppData", "Local")
+            root = Path(base) / "Requirement-Management-Tool" / "projects"
+        else:
+            base = os.environ.get("XDG_DATA_HOME") or os.path.join(Path.home(), ".local", "share")
+            root = Path(base) / "Requirement-Management-Tool" / "projects"
+        root = root.resolve()
+    else:
+        here = Path(file_path).resolve()
+        outer = None
+        for p in here.parents:
+            if p.name == "Requirement-Management-Tool":
+                outer = p  # this will end up the *highest* one
+        if outer is None:
+            # Fallback if the folder name is different on your machine
+            outer = here.parents[2]
+        root = (outer / "projects").resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -38,13 +57,16 @@ def both_project_dirs(project_name: str, file_path: str | Path) -> list[Path]:
 
 # ---------------- Sky animation ---------------- #
 class SkyView(QGraphicsView):
-    def __init__(self, assets_path="assets_png", parent=None):
+    def __init__(self, assets_path=None, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.scene = QGraphicsScene(self)
         self.setScene(self.scene)
         self.setRenderHints(QPainter.RenderHint.Antialiasing)
         self.setStyleSheet("background: transparent; border: none;")
+
+        # Resolve assets path (env var > bundled resource > default)
+        assets_path = assets_path or os.environ.get("ASSETS_PNG_PATH") or resource_path("assets_png")
 
         self.sky_bg = QGraphicsPixmapItem(QPixmap(f"{assets_path}/sky_bg.png"))
         self.sky_bg.setZValue(-10)
@@ -154,7 +176,7 @@ class MainFrontUI(QWidget):
         header.setFixedHeight(72)
         hl = QHBoxLayout(header)
         hl.setContentsMargins(20, 0, 20, 0)
-        logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
+        logo_path = resource_path(os.path.join("requirement_tool", "ui", "logo.png"))
         logo = QLabel()
         if os.path.exists(logo_path):
             logo.setPixmap(QPixmap(logo_path).scaled(150, 150, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
@@ -178,7 +200,7 @@ class MainFrontUI(QWidget):
         # --- Tool badge overlay (fully floating overlay above layout) --- #
         from PyQt6.QtWidgets import QGraphicsOpacityEffect
 
-        badge_path = os.path.join(os.path.dirname(__file__), "tool_badge.png")
+        badge_path = resource_path(os.path.join("requirement_tool", "ui", "tool_badge.png"))
         if os.path.exists(badge_path):
             self.badge_label = QLabel(self)
             self.badge_pix = QPixmap(badge_path)
