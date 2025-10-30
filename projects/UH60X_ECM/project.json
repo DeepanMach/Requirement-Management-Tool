@@ -1,8 +1,8 @@
 {
-    "name": "airbus",
-    "last_modified": "2025-10-29T23:10:40.350333",
+    "name": "UH60X_ECM",
+    "last_modified": "2025-10-30T12:22:18.443000",
     "header_profiles": {
-        "H398-002-001-ANA.docx": {
+        "__default__": {
             "document_title": "Software Requirements Specification for Gateway Module of EDAU in UH-60X Engine Instrument System",
             "document_number": "MGT-H398-GWY-S001",
             "revision": "2.4",
@@ -25,8 +25,12 @@
             "watermark_text": ""
         }
     },
+    "combine_word_tabs": true,
     "word_files": [
-        "H398-002-001-ANA.docx"
+        "Memory Margin Analysis.docx",
+        "Stack Depth Analysis Calculation.docx",
+        "Compiler and Linker Output Analysis.docx",
+        "Timing Throughput Analysis.docx"
     ],
     "word_pattern": {
         "mode": "prefixes",

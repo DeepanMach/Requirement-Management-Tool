@@ -744,7 +744,21 @@ class MainWindow(QMainWindow):
             pass
 
     def _projects_root(self) -> Path:
-        """<repo>/projects regardless of CWD (matches Main_page)."""
+        """Return the correct projects root.
+
+        - In frozen EXE builds: use the canonical user-writable location
+          (LOCALAPPDATA on Windows), matching clear/delete logic and ensuring
+          dropped/loaded files are stored under the project folder created there.
+        - In non-frozen (terminal/dev): keep existing repo-relative behavior.
+        """
+        try:
+            if getattr(sys, "frozen", False):
+                # Align with clear_all_tabs()/both_project_dirs() behavior
+                return canonical_projects_root(__file__)
+        except Exception:
+            pass
+
+        # Dev/terminal mode: preserve previous behavior
         here = Path(__file__).resolve()
         repo_root = here.parents[2]            # .../Requirement-Management-Tool
         projects = (repo_root / "projects").resolve()
@@ -918,6 +932,15 @@ class MainWindow(QMainWindow):
                             for n in (meta.get("word_files") or [])]
                 word_pattern = meta.get("word_pattern") or None
                 header_profiles = meta.get("header_profiles")
+                # Restore UI preference for Word tab combining
+                combine_pref = meta.get("combine_word_tabs")
+                if combine_pref is not None:
+                    try:
+                        self.combine_word_tabs = bool(combine_pref)
+                        if hasattr(self, "combine_word_chk"):
+                            self.combine_word_chk.setChecked(self.combine_word_tabs)
+                    except Exception:
+                        pass
 
                 # Threaded restore with visible progress (keeps UI responsive)
                 progress = QProgressDialog(f"Restoring project '{self.project_name}'...", None, 0, 100, self)
@@ -1077,8 +1100,6 @@ class MainWindow(QMainWindow):
         self.save_btn.clicked.connect(self.save_word)
         self.trace_btn = QPushButton('Traceability Matrix')
         self.trace_btn.clicked.connect(self.show_trace_view)
-        self.add_trace_btn = QPushButton("Add Trace Column")
-        self.add_trace_btn.clicked.connect(self.add_trace_column)
         self.save_excel_btn = QPushButton('Save Excel')
         self.save_excel_btn.clicked.connect(self.save_excel_with_images)
 
@@ -1112,7 +1133,6 @@ class MainWindow(QMainWindow):
             self.back_btn,
             self.save_btn,
             self.trace_btn,
-            self.add_trace_btn,
             self.save_excel_btn,
         ):
             button_row.addWidget(button)
@@ -1130,6 +1150,14 @@ class MainWindow(QMainWindow):
         self.preview_front_btn.clicked.connect(self.preview_front_page_only)
         self.remove_tab_btn = QPushButton("Remove Tab")
         self.remove_tab_btn.clicked.connect(self.remove_current_tab)
+        # Initialize preference before the checkbox references it
+        if not hasattr(self, "combine_word_tabs"):
+            self.combine_word_tabs = True
+        # Option toggle for combining Word tabs
+        self.combine_word_chk = QCheckBox("Combine Word Tabs")
+        self.combine_word_chk.setChecked(self.combine_word_tabs)
+        self.combine_word_chk.setToolTip("Show all Word documents in a single combined tab")
+        self.combine_word_chk.toggled.connect(lambda v: (setattr(self, "combine_word_tabs", bool(v)), self.populate_table()))
         for button in (
             self.add_image_btn,
             self.add_table_btn,
@@ -1139,6 +1167,7 @@ class MainWindow(QMainWindow):
         ):
             attachment_row.addWidget(button)
         attachment_row.addStretch()
+        attachment_row.addWidget(self.combine_word_chk)
         main_layout.addLayout(attachment_row)
 
 
@@ -1273,6 +1302,10 @@ class MainWindow(QMainWindow):
         self._tab_tables: Dict[str, QTableWidget] = {}
         self._tab_indices: Dict[str, list[int]] = {}
         self._tab_source_types: Dict[str, str] = {}
+        # Option: Combine all Word documents into a single 'Word' tab (like Excel)
+        # Initialized earlier (before checkbox); keep here for clarity if missing
+        if not hasattr(self, "combine_word_tabs"):
+            self.combine_word_tabs = True
         self._last_pattern_config: dict[str, str] = {"mode": "prefixes", "value": ""}
         self.default_header_settings = {
             "document_title": "Software Requirements Specification for Gateway Module of EDAU in UH-60X Engine Instrument System",
@@ -1508,6 +1541,7 @@ class MainWindow(QMainWindow):
             self.save_btn: "Export current project to a Word (.docx) file",
             self.trace_btn: "Open the Traceability Matrix (forward/backward) for selected tabs",
             self.save_excel_btn: "Export grouped requirements to Excel (with image thumbnails)",
+            self.combine_word_chk: "Combine multiple Word files into a single 'Word' tab",
             self.add_image_btn: "Insert an image as an attachment below the selected row",
             self.add_table_btn: "Insert a table attachment from CSV/Excel below the selected row",
             self.edit_header_btn: "Edit header/footer, front page details, logos and watermark",
@@ -1570,6 +1604,10 @@ class MainWindow(QMainWindow):
                 if key == "Excel":
                     if "SourceType" in df.columns:
                         mask = df["SourceType"].astype(str).str.lower().eq("excel")
+                        return df[mask].copy()
+                elif key == "Word":
+                    if "SourceType" in df.columns:
+                        mask = df["SourceType"].astype(str).str.lower().isin({"word","doc","docx","docm"})
                         return df[mask].copy()
                 else:
                     if "SourceFile" in df.columns:
@@ -1799,12 +1837,12 @@ class MainWindow(QMainWindow):
                     break
 
     # ------------------------------------------------------------------
-    def _show_reorder_dialog(self, files: Sequence[str]) -> Optional[list[str]]:
+    def _show_reorder_dialog(self, files: Sequence[str], title: str = "Reorder Excel Files") -> Optional[list[str]]:
         if not files:
             return None
         if len(files) == 1:
             return list(files)
-        dlg = ReorderFilesDialog(files, self, "Reorder Excel Files")
+        dlg = ReorderFilesDialog(files, self, title)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             ordered = dlg.ordered_paths()
             if not ordered:
@@ -2031,9 +2069,13 @@ class MainWindow(QMainWindow):
         )
         if not files:
             return
+        # Allow reordering of Word files similar to Excel
+        ordered = self._show_reorder_dialog(files, title="Reorder Word Files")
+        if not ordered:
+            return
 
         # Copy into project, then import from the local copies
-        local_paths = self._copy_into_project(files)
+        local_paths = self._copy_into_project(ordered)
         if not local_paths:
             return
         self._import_word_files(local_paths, pattern)
@@ -2100,9 +2142,30 @@ class MainWindow(QMainWindow):
         if excel_files:
             ordered = self._show_reorder_dialog(excel_files)
             if ordered:
-                self._import_excel_files(ordered)
+                # Copy into project, then import from local copies
+                local_paths_xls = self._copy_into_project(ordered)
+                if local_paths_xls:
+                    self._import_excel_files(local_paths_xls)
+                    # Persist metadata/state for Excel
+                    try:
+                        self._save_project_metadata(excel_files=local_paths_xls)
+                        self._save_project_state()
+                    except Exception:
+                        pass
         if word_files:
-            self._import_word_files(word_files, pattern_config)
+            # Copy into project, then import from local copies
+            ordered_word = self._show_reorder_dialog(word_files, title="Reorder Word Files")
+            if not ordered_word:
+                ordered_word = word_files
+            local_paths_doc = self._copy_into_project(ordered_word)
+            if local_paths_doc:
+                self._import_word_files(local_paths_doc, pattern_config)
+                # Persist metadata/state for Word
+                try:
+                    self._save_project_metadata(word_files=local_paths_doc, word_pattern=pattern_config)
+                    self._save_project_state()
+                except Exception:
+                    pass
         if unsupported:
             QMessageBox.warning(
                 self,
@@ -2153,10 +2216,15 @@ class MainWindow(QMainWindow):
                 tab_groups.append(("Excel", df[excel_mask], "excel"))
             word_mask = type_series.isin({"word", "doc", "docx", "docm"})
             if word_mask.any():
-                for source, group in df[word_mask].groupby("SourceFile", sort=False):
-                    tab_groups.append(
-                        (str(source).strip() or "Word Document", group, "docx")
-                    )
+                if getattr(self, "combine_word_tabs", False):
+                    # Combine all Word documents into a single 'Word' tab
+                    tab_groups.append(("Word", df[word_mask], "docx"))
+                else:
+                    # One tab per Word document
+                    for source, group in df[word_mask].groupby("SourceFile", sort=False):
+                        tab_groups.append(
+                            (str(source).strip() or "Word Document", group, "docx")
+                        )
             other_mask = ~(excel_mask | word_mask)
             if other_mask.any():
                 for source, group in df[other_mask].groupby("SourceFile", sort=False):
@@ -4362,6 +4430,9 @@ class MainWindow(QMainWindow):
 
         pending_requirement_rule = False
 
+        # Track paragraph rows used as captions so we don't duplicate them later
+        used_caption_rows: set[int] = set()
+
         # Identify front-page image filenames for the active source to suppress in export
         front_image_names: set[str] = set()
         try:
@@ -4380,8 +4451,37 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        for index, row in df.iterrows():
-            global_index = int(row.get("_global_index", index)) if "_global_index" in row else index
+        # Regex helpers for captions like "Table 3: Title" or "Figure 2: Title"
+        import re as _re
+        _rx_table = _re.compile(r"^\s*table\s+(\d+)\s*[:\-–]\s*(.*)$", _re.IGNORECASE)
+        _rx_figure = _re.compile(r"^\s*(?:figure|fig\.)\s+(\d+)\s*[:\-–]\s*(.*)$", _re.IGNORECASE)
+
+        def _extract_caption(text: str, kind: str) -> tuple[bool, str]:
+            t = str(text or "").strip()
+            m = _rx_table.match(t) if kind == "table" else _rx_figure.match(t)
+            if not m:
+                return False, ""
+            return True, (m.group(2) or "").strip()
+
+        def _find_adjacent_caption(idx: int, kind: str) -> tuple[int | None, str]:
+            prefer_above = (kind == "table")
+            candidates = ([idx - 1, idx + 1] if prefer_above else [idx + 1, idx - 1])
+            for j in candidates:
+                if j < 0 or j >= len(df):
+                    continue
+                rowj = df.iloc[j]
+                att_j = str(rowj.get("Attachment Type", "")).strip().lower()
+                if att_j:
+                    continue
+                txt = str(rowj.get("Object Text", "")).strip()
+                ok, tail = _extract_caption(txt, kind)
+                if ok:
+                    return j, tail
+            return None, ""
+
+        for _pos in range(len(df)):
+            row = df.iloc[_pos]
+            global_index = int(row.get("_global_index", _pos)) if "_global_index" in row else _pos
             obj_type = str(row.get("Object Type", "")).strip().lower()
             section = str(row.get(section_col, "")).strip()
             text_value = str(row.get("Object Text", "")).strip()
@@ -4406,10 +4506,15 @@ class MainWindow(QMainWindow):
                 continue
 
             if attachment_type == "table" and attachment_data:
+                # Attach caption from adjacent paragraph if present (prefer above table)
+                cap_row, cap_tail = _find_adjacent_caption(_pos, "table")
+                if cap_row is not None:
+                    used_caption_rows.add(int(cap_row))
+                caption_to_use = cap_tail or text_value
                 self._add_table_from_html(
                     document,
                     attachment_data,
-                    text_value,
+                    caption_to_use,
                     BeautifulSoup,
                     WD_ALIGN_PARAGRAPH,
                     table_alignment,
@@ -4428,10 +4533,15 @@ class MainWindow(QMainWindow):
                     nm = ""
                 if nm and nm in front_image_names:
                     continue
+                # Attach caption from adjacent paragraph if present (prefer below image)
+                cap_row, cap_tail = _find_adjacent_caption(_pos, "figure")
+                if cap_row is not None:
+                    used_caption_rows.add(int(cap_row))
+                caption_to_use = cap_tail or text_value
                 self._add_image_from_payload(
                     document,
                     attachment_data,
-                    text_value,
+                    caption_to_use,
                     settings,
                     Inches,
                     WD_ALIGN_PARAGRAPH,
@@ -4457,7 +4567,7 @@ class MainWindow(QMainWindow):
                 pending_requirement_rule = True
                 continue
 
-            if text_value:
+            if text_value and (_pos not in used_caption_rows):
                 paragraph = document.add_paragraph(text_value)
                 paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
@@ -4483,6 +4593,21 @@ class MainWindow(QMainWindow):
         rows = soup.find_all("tr")
         if not rows:
             return
+
+        # Caption ABOVE the table (Word LOT expects caption paragraphs)
+        caption_text = caption.strip()
+        caption_para = document.add_paragraph(style="Caption")
+        caption_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        label_run = caption_para.add_run("Table ")
+        label_run.font.bold = False
+        label_run.font.color.rgb = RGBColor(0, 0, 0)
+        self._append_seq_field(caption_para, "Table", RGBColor, OxmlElement, qn)
+        tail_text = f": {caption_text}" if caption_text else ""
+        tail_run = caption_para.add_run(tail_text)
+        tail_run.font.bold = False
+        tail_run.font.color.rgb = RGBColor(0, 0, 0)
+
+        # Then the table itself
         max_cols = max(len(row.find_all(["td", "th"])) for row in rows)
         table = document.add_table(rows=len(rows), cols=max_cols)
         table.style = "Table Grid"
@@ -4496,18 +4621,6 @@ class MainWindow(QMainWindow):
                     break
                 cell_text = cell.get_text(separator="\n").strip()
                 table.cell(row_idx, col_idx).text = cell_text
-
-        caption_text = caption.strip()
-        caption_para = document.add_paragraph(style="Caption")
-        caption_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        label_run = caption_para.add_run("Table ")
-        label_run.font.bold = False
-        label_run.font.color.rgb = RGBColor(0, 0, 0)
-        self._append_seq_field(caption_para, "Table", RGBColor, OxmlElement, qn)
-        tail_text = f": {caption_text}" if caption_text else ""
-        tail_run = caption_para.add_run(tail_text)
-        tail_run.font.bold = False
-        tail_run.font.color.rgb = RGBColor(0, 0, 0)
 
     def _add_image_from_payload(
         self,
@@ -5223,10 +5336,9 @@ class MainWindow(QMainWindow):
             return
 
         # Build grouped export from the full dataset (across tabs)
+        # Allow saving even when there are no requirements: create a workbook
+        # with just the header row so users can save an empty template.
         df_export = self.data_manager.build_grouped_export()
-        if df_export.empty:
-            QMessageBox.information(self, "Empty", "No requirements to export.")
-            return
 
         file_name, _ = QFileDialog.getSaveFileName(
             self, "Save Excel (with images)", "", "Excel Files (*.xlsx)"
@@ -5256,39 +5368,40 @@ class MainWindow(QMainWindow):
 
         # Row-by-row copy + embed image thumbnails
         thumb_max_w, thumb_max_h = 140, 100   # pixels (roughly maps to Excel cell size)
-        for _, row in df_export.iterrows():
-            ws.append([
-                row.get("Requirement ID", ""),
-                row.get("Requirement Content", ""),
-                row.get("Referenced Tables", ""),
-                row.get("Referenced Figures", ""),
-                row.get("Image Path(s)", ""),
-            ])
-            excel_row = ws.max_row
+        if not df_export.empty:
+            for _, row in df_export.iterrows():
+                ws.append([
+                    row.get("Requirement ID", ""),
+                    row.get("Requirement Content", ""),
+                    row.get("Referenced Tables", ""),
+                    row.get("Referenced Figures", ""),
+                    row.get("Image Path(s)", ""),
+                ])
+                excel_row = ws.max_row
 
-            # Embed first image as thumbnail in the last column cell
-            img_paths = [p.strip() for p in str(row.get("Image Path(s)", "")).split(",") if p.strip()]
-            if not img_paths:
-                continue
-            first = img_paths[0]
-            if not Path(first).exists():
-                continue
+                # Embed first image as thumbnail in the last column cell
+                img_paths = [p.strip() for p in str(row.get("Image Path(s)", "")).split(",") if p.strip()]
+                if not img_paths:
+                    continue
+                first = img_paths[0]
+                if not Path(first).exists():
+                    continue
 
-            try:
-                with PILImage.open(first) as im:
-                    im.thumbnail((thumb_max_w, thumb_max_h))  # in-place thumbnail
-                    buf = io.BytesIO()
-                    im.save(buf, format="PNG")
-                    buf.seek(0)
-                    xl_img = XLImage(buf)
-                    # Anchor to the "Image Path(s)" column cell
-                    anchor_cell = f"E{excel_row}"  # column E = 5th col
-                    ws.add_image(xl_img, anchor_cell)
-                    # Increase row height a bit to show the thumb
-                    ws.row_dimensions[excel_row].height = 80
-            except Exception:
-                # ignore bad images silently; paths are still present in cell
-                pass
+                try:
+                    with PILImage.open(first) as im:
+                        im.thumbnail((thumb_max_w, thumb_max_h))  # in-place thumbnail
+                        buf = io.BytesIO()
+                        im.save(buf, format="PNG")
+                        buf.seek(0)
+                        xl_img = XLImage(buf)
+                        # Anchor to the "Image Path(s)" column cell
+                        anchor_cell = f"E{excel_row}"  # column E = 5th col
+                        ws.add_image(xl_img, anchor_cell)
+                        # Increase row height a bit to show the thumb
+                        ws.row_dimensions[excel_row].height = 80
+                except Exception:
+                    # ignore bad images silently; paths are still present in cell
+                    pass
 
         try:
             wb.save(file_name)
@@ -5296,8 +5409,12 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save Error", f"Failed to save Excel: {exc}")
             return
 
-        self.log_console(f"Excel saved with embedded thumbnails: {file_name}")
-        QMessageBox.information(self, "Saved", f"Excel saved:\n{file_name}")
+        if df_export.empty:
+            self.log_console(f"Empty Excel template saved: {file_name}")
+            QMessageBox.information(self, "Saved", f"Empty Excel saved with headers only:\n{file_name}")
+        else:
+            self.log_console(f"Excel saved with embedded thumbnails: {file_name}")
+            QMessageBox.information(self, "Saved", f"Excel saved:\n{file_name}")
     
         
     def find_next_match(self):
@@ -5388,6 +5505,11 @@ class MainWindow(QMainWindow):
             data["word_pattern"] = word_pattern
         if header_profiles is not None:
             data["header_profiles"] = header_profiles
+        # Persist UI preference for Word tab combining
+        try:
+            data["combine_word_tabs"] = bool(self.combine_word_tabs)
+        except Exception:
+            pass
 
         self.project_meta.write_text(json.dumps(data, indent=4), encoding="utf-8")
 
@@ -5445,24 +5567,7 @@ class MainWindow(QMainWindow):
         if files:
             self.add_excel_tab_from_files(files)
 
-    # Drag & Drop: accept Excel files anywhere on main window
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            for url in event.mimeData().urls():
-                if url.isLocalFile() and url.toLocalFile().lower().endswith((".xlsx", ".xls", ".xlsm")):
-                    event.acceptProposedAction()
-                    return
-        event.ignore()
-
-    def dropEvent(self, event):
-        files = [
-            url.toLocalFile() for url in event.mimeData().urls()
-            if url.isLocalFile() and url.toLocalFile().lower().endswith((".xlsx", ".xls", ".xlsm"))
-        ]
-        if files:
-            self.add_excel_tab_from_files(files)
-        else:
-            event.ignore()
+    # (Removed duplicate Excel-only drag/drop; earlier handlers support Word+Excel and project copy.)
 
 
 
