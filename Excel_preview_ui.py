@@ -83,25 +83,32 @@ def detect_markdown_table(text: str) -> Optional[Tuple[int, int, List[List[str]]
     return (len(data), cols, data, has_header)
 
 
-def save_table_payload(rows: int, cols: int, data: List[List[str]], name: str = "") -> str:
+def save_table_payload(rows: int, cols: int, data: List[List[str]], name: str = "", merges: Optional[List[dict]] = None) -> str:
     payload = {
         "type": "table",
         "rows": int(rows),
         "cols": int(cols),
         "data": data,
         "name": name or "",
+        "merges": list(merges or []),
     }
     return f"[Table]|{json.dumps(payload, ensure_ascii=False)}"
 
 
-def load_table_payload(value: str) -> Tuple[int, int, List[List[str]], str]:
+def load_table_payload(value: str) -> Tuple[int, int, List[List[str]], str, List[dict]]:
     try:
         if not is_table_marker(value):
-            return (0, 0, [], "")
+            return (0, 0, [], "", [])
         obj = json.loads(str(value).split('|', 1)[1])
-        return int(obj.get("rows", 0)), int(obj.get("cols", 0)), list(obj.get("data", [])), str(obj.get("name", ""))
+        return (
+            int(obj.get("rows", 0)),
+            int(obj.get("cols", 0)),
+            list(obj.get("data", [])),
+            str(obj.get("name", "")),
+            list(obj.get("merges", [])),
+        )
     except Exception:
-        return (0, 0, [], "")
+        return (0, 0, [], "", [])
 
 
 def is_image_marker(value: str) -> bool:
@@ -294,9 +301,31 @@ class ExcelPreviewWidget(QWidget):
             m = HEADING_RE.match((ot or '').strip())
             return int(m.group(1)) if m else 0
 
+        # Precompute caption rows that are immediately above a table row
+        caption_above_skip: set[int] = set()
+        try:
+            import re as _re
+            def row_has_table(r) -> bool:
+                for cc in cols:
+                    if is_table_marker(r.get(cc, "")):
+                        return True
+                return False
+            for _i in range(len(df) - 1):
+                r0 = df.iloc[_i]
+                r1 = df.iloc[_i + 1]
+                if str(r0.get("Object Type", "")).strip().lower() == "text":
+                    t = str(r0.get("Object Text", "") or "")
+                    if _re.match(r"^\s*table\s*(?:no\.?|number)?\s*[:\-]?\s*(\d+)?\s*", t, flags=_re.I) and row_has_table(r1):
+                        caption_above_skip.add(_i)
+        except Exception:
+            caption_above_skip = set()
+
         fig_n = 0
         tbl_n = 0
-        for _, row in df.iterrows():
+        for _idx in range(len(df)):
+            row = df.iloc[_idx]
+            if _idx in caption_above_skip:
+                continue
             ot = str(row.get("Object Type", "")).strip()
             txt = str(row.get("Object Text", "")).strip()
             lvl = heading_level(ot)
@@ -305,6 +334,15 @@ class ExcelPreviewWidget(QWidget):
                 out.append(f"<{tag} style='margin:6px 0 4px 0;'>{txt}</{tag}>")
                 continue
             rendered = False
+            # If this is a caption text row above a table, skip it; the table will render its caption
+            try:
+                import re as _re
+                if str(ot).lower() == "text" and _re.match(r"^\s*table\s*(?:no\.?|number)?\s*[:\-]?\s*\d+", txt, flags=_re.I):
+                    # Look ahead for a table marker in the next row
+                    # (We need the iterator index; fallback: scan columns for marker)
+                    pass
+            except Exception:
+                pass
             for c in cols:
                 val = row.get(c, "")
                 if is_image_marker(val):
@@ -321,23 +359,45 @@ class ExcelPreviewWidget(QWidget):
                         out.append(f"<p style='color:#a00'>[Missing Image: {os.path.basename(pth)}]</p>")
                     rendered = True
                 elif is_table_marker(val):
-                    r, cnum, data, name = load_table_payload(val)
+                    r, cnum, data, name, merges = load_table_payload(val)
                     tbl_n += 1
+                    # Build span map from merges
+                    span_map: dict[tuple[int,int], tuple[int,int]] = {}
+                    covered: set[tuple[int,int]] = set()
+                    try:
+                        for m in merges or []:
+                            rr = int(m.get("r", 0)); cc = int(m.get("c", 0))
+                            rs = max(1, int(m.get("rowspan", 1)))
+                            cs = max(1, int(m.get("colspan", 1)))
+                            span_map[(rr, cc)] = (rs, cs)
+                            for ii in range(rr, rr+rs):
+                                for jj in range(cc, cc+cs):
+                                    if (ii, jj) != (rr, cc):
+                                        covered.add((ii, jj))
+                    except Exception:
+                        span_map = {}; covered = set()
+
                     html_rows = ["<table border='1' cellspacing='0' cellpadding='6' style='border-collapse:collapse;margin:8px auto;'>"]
                     for i in range(max(1, r)):
                         html_rows.append("<tr>")
                         for j in range(max(1, cnum)):
+                            if (i, j) in covered:
+                                continue
                             try:
                                 cell = str(data[i][j])
                             except Exception:
                                 cell = ""
                             tag2 = "th" if i == 0 and any(data[0]) else "td"
                             style = "font-weight:bold;" if tag2 == "th" else ""
-                            html_rows.append(f"<{tag2} style='{style}'>{cell}</{tag2}>")
+                            rs, cs = span_map.get((i, j), (1, 1))
+                            span_attr = (f" rowspan='{rs}'" if rs > 1 else "") + (f" colspan='{cs}'" if cs > 1 else "")
+                            html_rows.append(f"<{tag2}{span_attr} style='{style}'>{cell}</{tag2}>")
                         html_rows.append("</tr>")
                     html_rows.append("</table>")
                     out.append("".join(html_rows))
-                    out.append(f"<div style='text-align:center;font-style:italic;font-size:10pt;'>Table {tbl_n}: {txt or name}</div>")
+                    # Do not auto-prefix a caption number here; show provided text or name
+                    if (txt or name):
+                        out.append(f"<div style='text-align:center;font-style:italic;font-size:10pt;'>{txt or name}</div>")
                     rendered = True
             if not rendered and txt:
                 out.append(f"<div>{self._text_to_html_blocks(txt)}</div>")
@@ -385,7 +445,7 @@ class ExcelPreviewWidget(QWidget):
                         md = detect_markdown_table(str(df.at[i, c]))
                         if md:
                             rows, cols, data, _ = md
-                            df.at[i, c] = save_table_payload(rows, cols, data, name="")
+                            df.at[i, c] = save_table_payload(rows, cols, data, name="", merges=None)
                             stats["tables"] += 1
 
                 # Insert extracted images at their approximate positions as new rows
@@ -819,4 +879,3 @@ if __name__ == "__main__":
     win = DemoWindow()
     win.show()
     sys.exit(app.exec())
-

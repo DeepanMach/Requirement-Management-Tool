@@ -1,6 +1,6 @@
 {
-    "name": "UH60X_ECM",
-    "last_modified": "2025-10-31T12:40:17.958990",
+    "name": null,
+    "last_modified": "2025-10-31T01:16:29.848114",
     "header_profiles": {
         "__default__": {
             "document_title": "Software Requirements Specification for Gateway Module of EDAU in UH-60X Engine Instrument System",
@@ -26,11 +26,5 @@
         }
     },
     "combine_word_tabs": true,
-    "word_files": [
-        "H698-003-011-CMU.docx"
-    ],
-    "word_pattern": {
-        "mode": "prefixes",
-        "value": "dau"
-    }
+    "ignore_explicit_heading_numbers": true
 }

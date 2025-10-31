@@ -29,12 +29,8 @@ LOGGER = logging.getLogger(__name__)
 # 🔧 Helper Functions (taken and simplified from ReqIDTool)
 # ----------------------------------------------------------------------
 def clean_id(text: str) -> str:
-    """Normalize an extracted ID: remove unwanted spaces, trim, and fix PDF-like artifacts."""
-    text = text.strip("[]()").rstrip(",:;.").strip()
-    text = re.sub(r"\s+", "", text)
-    text = re.sub(r"([A-Za-z0-9\-_]+-)(\d{5,})(\.\d+)?$", lambda m: m.group(1) + m.group(2)[:4], text)
-    text = re.sub(r"([A-Za-z0-9\-_]+-\d{1,4})\.\d{1,2}$", r"\1", text)
-    return text
+    """Return trimmed text. Requirement detection now preserves exact matches."""
+    return str(text or "").strip()
 
 def build_regex_from_prefix(prefix: str) -> str:
     prefix = prefix.rstrip("-_")
@@ -53,6 +49,106 @@ def build_regexes_from_input(user_input: str) -> list[re.Pattern[str]]:
         except re.error as exc:
             LOGGER.warning("Invalid regex for prefix %s: %s", p, exc)
     return regexes
+
+def compile_user_patterns(user_input: str, manual_regex: bool) -> list[re.Pattern[str]]:
+    """
+    Compile patterns strictly from user input.
+    - manual_regex=True: each non-empty line is compiled as-is.
+    - manual_regex=False: each line is compiled as a literal substring (escaped).
+    Returns: list of compiled regex objects.
+    """
+    lines = [ln.strip() for ln in str(user_input or "").replace(",", "\n").splitlines() if ln.strip()]
+    out: list[re.Pattern[str]] = []
+    for idx, line in enumerate(lines, start=1):
+        pat = line if manual_regex else re.escape(line)
+        try:
+            out.append(re.compile(pat))
+        except re.error as exc:
+            LOGGER.warning("Invalid pattern on line %s: %s -> %s", idx, line, exc)
+    return out
+
+
+# -------------------- Prefix-based ID regex builder --------------------
+def _build_id_core_from_prefix(prefix: str) -> str:
+    """Return an ID-core regex (without group names) tailored from a prefix.
+
+    Heuristics:
+    - 'CAP-SRS' or contains '-SRS': digits with optional decimal, e.g. CAP-SRS-123 or CAP-SRS-123.4
+    - 'H' + digits (e.g., H398): three to four dash groups of A-Z0-9, e.g., H398-XXX-XXX-XXX
+    - 'DAU' (case-insensitive): DAUxxx-xxx-(HLR|LLR)-xxx (tolerant A-Z0-9 counts)
+    - Fallback: prefix + alnum tail + final numeric with optional .X, tolerant of '_' or '-'
+    """
+    p = str(prefix or "").strip()
+    if not p:
+        return ""
+    up = p.upper()
+    if "-SRS" in up or up.endswith("SRS") or up.startswith("SRS-"):
+        # System requirements like CAP-SRS-123 or CAP-SRS-123.4
+        return rf"{re.escape(p)}-\d{{1,4}}(?:\.\d+)?"
+    if up.startswith("H") and up[1:].isdigit():
+        # H###-XXX-XXX-XXX style
+        return rf"{re.escape(p)}-[A-Z0-9]{{2,10}}(?:-[A-Z0-9]{{2,10}}){{2,3}}"
+    if up.startswith("DAU"):
+        # DAUxxx-xxx-(HLR|LLR)-xxx pattern (tolerant segment sizes)
+        return r"DAU[A-Z0-9]{2,}-[A-Z0-9]{2,}-(?:HLR|LLR)-[A-Z0-9]{2,}"
+    # Generic prefix fallback: <prefix><alnum/-/_>*[-_]digits[.digits]?
+    return rf"{re.escape(p)}[A-Z0-9\-_]*[-_]\d+(?:\.\d+)?"
+
+
+def build_requirement_patterns_from_prefixes(user_input: str) -> list[re.Pattern[str]]:
+    """Build compiled regex patterns from comma/line-separated prefixes.
+
+    For each prefix, produce patterns with named groups:
+    - ID anywhere: (?P<id>...core...)
+    - Requirement line: ^(Requirement|Req...) ... (?P<id>...core...) (optional body)
+    """
+    prefixes = [p.strip() for p in str(user_input or "").replace(",", "\n").splitlines() if p.strip()]
+    patterns: list[re.Pattern[str]] = []
+    for p in prefixes:
+        core = _build_id_core_from_prefix(p)
+        if not core:
+            continue
+        try:
+            pat_id_anywhere = re.compile(rf"(?P<id>{core})", re.IGNORECASE)
+            # Capture any trailing text as body even without a delimiter after the ID
+            pat_req_line = re.compile(
+                rf"^\s*(?:Requirement|Req(?:uirement)?(?:\s*(?:ID|No))?)\s*[:\-–]?\s*(?P<id>{core})\s*(?P<body>.*)$",
+                re.IGNORECASE,
+            )
+            patterns.extend([pat_req_line, pat_id_anywhere])
+        except re.error as exc:
+            LOGGER.warning("Invalid prefix-built regex for '%s': %s", p, exc)
+    return patterns
+
+
+def preview_prefix_patterns(user_input: str) -> list[str]:
+    """Return pattern strings for UI preview from prefix input."""
+    out: list[str] = []
+    prefixes = [p.strip() for p in str(user_input or "").replace(",", "\n").splitlines() if p.strip()]
+    for p in prefixes:
+        core = _build_id_core_from_prefix(p)
+        if not core:
+            continue
+        out.append(f"{p} → (?P<id>{core})")
+        out.append(f"{p} → ^(?:Requirement|Req...) (?P<id>{core})(?::|\u2013|-)? (?P<body>.+)")
+    return out
+
+
+def _dedup_section_label(s: str) -> str:
+    """Collapse immediate duplicate numeric section labels at start of string.
+    Example: '10.1.1 10.1.1 Title' -> '10.1.1 Title'.
+    """
+    if not s:
+        return s
+    txt = str(s).strip()
+    # Remove repeated leading identical numeric labels (once or multiple)
+    # Loop to catch triple repeats, etc.
+    for _ in range(3):
+        m = re.match(r"^\s*(\d+(?:\.\d+)*)\s+\1\b(.*)$", txt)
+        if not m:
+            break
+        txt = f"{m.group(1)}{m.group(2)}".strip()
+    return txt
 
 
 
@@ -105,6 +201,9 @@ class RequirementDataManager:
     skip_front_matter_for_word: bool = False
     front_matter_records: Dict[str, List[Dict[str, str]]] = field(default_factory=dict, init=False)
     front_matter_count: Dict[str, int] = field(default_factory=dict, init=False)
+    # When True, ignore any numeric prefixes already present in Object Text
+    # and re-number headings purely from Object Type (Heading 1..6).
+    ignore_explicit_heading_numbers: bool = False
     _custom_patterns: list[re.Pattern[str]] = field(default_factory=list, init=False)
     _REQ_ID_PATTERNS: ClassVar[Sequence[re.Pattern[str]]] = (
         re.compile(r"^\s*Requirement\s*ID\s*[:\-]\s*(?P<id>[A-Za-z0-9_.\-]+)\s*(?P<body>.*)$", re.IGNORECASE),
@@ -166,8 +265,9 @@ class RequirementDataManager:
                     # out.at[i, "Object Type"] = "Image"
                 elif is_tbl:
                     cap = txt_no_tbl or txt_no_fig or text
-                    out.at[i, "Object Text"] = f"Table {tbl_n}: {cap}".strip()
-                    tbl_n += 1
+                    # Keep original caption/numbering; do not inject auto numbering
+                    out.at[i, "Object Text"] = cap.strip()
+                    tbl_n += 1  # advance for legacy callers
                     # Optionally normalize:
                     # out.at[i, "Object Type"] = "Table"
                 else:
@@ -220,6 +320,12 @@ class RequirementDataManager:
             if m:
                 num = m.group(1)
                 cap = text[m.end():].strip()
+                rows.append({"Table": num, "Caption": cap, "SourceFile": r.get("SourceFile","")})
+                continue
+            m2 = TABLE_NO_ANY_RE.match(text)
+            if m2:
+                num = m2.group(1)
+                cap = text[m2.end():].strip()
                 rows.append({"Table": num, "Caption": cap, "SourceFile": r.get("SourceFile","")})
         return pd.DataFrame(rows, columns=["Table","Caption","SourceFile"])
 
@@ -458,6 +564,185 @@ class RequirementDataManager:
             or "list of figures" in lowered_text
             or "list of tables" in lowered_text
         )
+
+    # ---------------- Inline formatting and list helpers ----------------
+    def _paragraph_inlines_to_html(self, paragraph) -> str:
+        try:
+            from docx.oxml.ns import qn  # type: ignore
+        except Exception:
+            qn = None
+        chunks: list[str] = []
+        import urllib.parse as _url
+        import re as _re
+
+        def _sanitize_href(h: str) -> str:
+            s = str(h or "").strip()
+            if not s:
+                return ""
+            # Convert backslashes to forward slashes and percent-encode spaces
+            s = s.replace("\\", "/")
+            if s.startswith("http://") or s.startswith("https://"):
+                try:
+                    parts = _url.urlsplit(s)
+                    path = _url.quote(parts.path or "", safe="/%@:+,._-~")
+                    query = _url.quote_plus(parts.query, safe="=&;%@:+,._-~") if parts.query else ""
+                    frag = _url.quote(parts.fragment, safe="@:+,._-~") if parts.fragment else ""
+                    s = _url.urlunsplit((parts.scheme, parts.netloc, path, query, frag))
+                except Exception:
+                    pass
+            return s
+        for run in paragraph.runs:
+            t = run.text or ""
+            if not t:
+                continue
+            s = html.escape(t)
+            href = ""
+            try:
+                if qn is not None:
+                    links = run._r.xpath('ancestor::w:hyperlink', namespaces={'w':'http://schemas.openxmlformats.org/wordprocessingml/2006/main'})
+                    if links:
+                        link_el = links[0]
+                        rid = link_el.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                        if rid and rid in paragraph.part.rels:
+                            href = paragraph.part.rels[rid]._target
+                        else:
+                            anchor = link_el.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}anchor') or ""
+                            if anchor:
+                                href = f"#{anchor}"
+            except Exception:
+                href = ""
+            href = _sanitize_href(href)
+            # Bold/italic detection also via character styles
+            is_bold = False
+            try:
+                is_bold = bool(run.bold) or bool(getattr(run.font, 'bold', False))
+            except Exception:
+                pass
+            try:
+                stname = run.style.name.lower() if run.style and run.style.name else ""
+                if ('bold' in stname) or ('strong' in stname):
+                    is_bold = True
+            except Exception:
+                pass
+            if is_bold:
+                s = f"<strong>{s}</strong>"
+            is_italic = False
+            try:
+                is_italic = bool(run.italic)
+            except Exception:
+                pass
+            try:
+                stname = run.style.name.lower() if run.style and run.style.name else ""
+                if ('emphasis' in stname) or ('italic' in stname):
+                    is_italic = True
+            except Exception:
+                pass
+            if is_italic:
+                s = f"<em>{s}</em>"
+            try:
+                if bool(getattr(run.font, 'underline', False)):
+                    s = f"<u>{s}</u>"
+            except Exception:
+                pass
+            if href:
+                display = s if s.strip() else html.escape(str(href))
+                href_txt = html.escape(str(href))
+                if href_txt:
+                    # Show the target in parentheses for clarity
+                    s = f"<a href=\"{href_txt}\">{display}</a> (<span class=\"link-href\">{href_txt}</span>)"
+                else:
+                    # If after sanitation it's empty, just keep the text
+                    s = display
+            chunks.append(s)
+        content = "".join(chunks).strip()
+        try:
+            left = paragraph.paragraph_format.left_indent
+            if left and hasattr(left, 'pt'):
+                px = int(float(left.pt) * 1.33)
+                return f'<p style="margin-left:{px}px;">{content}</p>'
+        except Exception:
+            pass
+        # Fallback auto-link: add anchors for visible http(s) URLs in plain text
+        if '<a ' not in content.lower():
+            def _repl(m):
+                raw = m.group(0)
+                safe = _sanitize_href(raw)
+                safe_html = html.escape(safe)
+                disp = html.escape(raw)
+                return f'<a href="{safe_html}">{disp}</a> (<span class="link-href">{safe_html}</span>)'
+            content = _re.sub(r'https?://[^\s<>]+', _repl, content)
+        return f"<p>{content}</p>"
+
+    def _resolve_numbering_format(self, document, num_id: int, ilvl: int) -> tuple[bool, str]:
+        cache = getattr(self, '_numfmt_cache', None)
+        if cache is None:
+            cache = {}
+            self._numfmt_cache = cache
+        key = (int(num_id), int(ilvl))
+        if key in cache:
+            return cache[key]
+        try:
+            part = getattr(document.part, 'numbering_part', None) or getattr(document.part, '_numbering_part', None)
+            numbering_el = getattr(part, 'element', None) if part else None
+            if numbering_el is not None:
+                ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+                num_nodes = numbering_el.xpath(f".//w:num[@w:numId='{num_id}']/w:abstractNumId", namespaces=ns)
+                if num_nodes:
+                    abs_id = num_nodes[0].get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val')
+                    lvl_nodes = numbering_el.xpath(f".//w:abstractNum[@w:abstractNumId='{abs_id}']/w:lvl[@w:ilvl='{ilvl}']/w:numFmt", namespaces=ns)
+                    if lvl_nodes:
+                        fmt = lvl_nodes[0].get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val') or 'decimal'
+                        ordered = (fmt != 'bullet')
+                        cache[key] = (ordered, fmt)
+                        return cache[key]
+        except Exception:
+            pass
+        cache[key] = (True, 'decimal')
+        return cache[key]
+
+    def _paragraph_list_info(self, paragraph, document) -> Optional[dict]:
+        try:
+            ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+            numPr = paragraph._p.xpath('w:pPr/w:numPr', namespaces=ns)
+            if not numPr:
+                raise AttributeError("no numPr")
+            ilvl_nodes = paragraph._p.xpath('w:pPr/w:numPr/w:ilvl', namespaces=ns)
+            num_nodes = paragraph._p.xpath('w:pPr/w:numPr/w:numId', namespaces=ns)
+            ilvl = int(ilvl_nodes[0].get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val')) if ilvl_nodes else 0
+            num_id = int(num_nodes[0].get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val')) if num_nodes else 0
+            ordered, fmt = self._resolve_numbering_format(document, num_id, ilvl)
+            return {"level": ilvl + 1, "ordered": bool(ordered), "fmt": str(fmt)}
+        except Exception:
+            # Heuristic fallback: inspect text prefix and left indent
+            try:
+                s = (paragraph.style.name or '').lower()
+                text = (paragraph.text or '').strip()
+                # Determine level from left indent (approx 18pt per level)
+                level = 1
+                try:
+                    li = paragraph.paragraph_format.left_indent
+                    if li and hasattr(li, 'pt'):
+                        level = max(1, min(10, 1 + int(float(li.pt) / 18.0)))
+                except Exception:
+                    level = 1
+                # Prefix checks
+                import re as _re
+                if _re.match(r"^\s*[\-\*•]\s+", text) or ('bullet' in s):
+                    return {"level": level, "ordered": False, "fmt": 'bullet'}
+                m = _re.match(r"^\s*(\d+)\s*[\).]", text)
+                if m:
+                    return {"level": level, "ordered": True, "fmt": 'decimal'}
+                m = _re.match(r"^\s*([ivxlcdm]+)\s*[\).]", text, flags=_re.I)
+                if m:
+                    fmt = 'lowerRoman' if m.group(1).islower() else 'upperRoman'
+                    return {"level": level, "ordered": True, "fmt": fmt}
+                m = _re.match(r"^\s*([a-zA-Z])\s*[\).]", text)
+                if m:
+                    fmt = 'lowerLetter' if m.group(1).islower() else 'upperLetter'
+                    return {"level": level, "ordered": True, "fmt": fmt}
+            except Exception:
+                pass
+            return None
     # ------------------------------------------------------------------
     def load_word_documents(self, paths: Iterable[str], progress_callback=None, *, interactive: bool = True) -> pd.DataFrame:
         """Load requirement data from one or more Word documents (.docx)."""
@@ -627,7 +912,8 @@ class RequirementDataManager:
             return rest, label
 
         current_source = None
-        h1 = h2 = h3 = 0
+        # Track counters for Heading levels 1..10
+        h = [0]*10  # indices 0..9 represent levels 1..10
         new_obj_types: list[str] = []
         new_obj_texts: list[str] = []
 
@@ -635,7 +921,7 @@ class RequirementDataManager:
             source = row.get("SourceFile", "")
             if source != current_source:
                 current_source = source
-                h1 = h2 = h3 = 0
+                h = [0]*10
 
             raw_type = str(row.get("Object Type", "") or "").strip()
             raw_type_l = raw_type.lower()
@@ -643,48 +929,40 @@ class RequirementDataManager:
             text = str(row.get("Object Text", "") or "")
             clean_text, explicit_label = strip_leading_number(text)
 
-            # --- Explicit numbering in text (like "1.2 Scope") ---
-            if explicit_label:
+            # --- Explicit numbering in text (like "1.2 Scope" or "1.2.3.4 Title") ---
+            if explicit_label and not self.ignore_explicit_heading_numbers:
                 parts = explicit_label.split('.')
-                level = min(len(parts), 3)
+                level = min(len(parts), 10)
                 try:
                     nums = [int(p) for p in parts]
                 except ValueError:
                     nums = []
-                if len(nums) >= 1:
-                    h1 = nums[0]
-                if len(nums) >= 2:
-                    h2 = nums[1]
-                else:
-                    h2 = 0
-                if len(nums) >= 3:
-                    h3 = nums[2]
-                else:
-                    h3 = 0
+                # Reset all counters, then set according to explicit parts
+                h = [0]*10
+                for i, n in enumerate(nums[:10]):
+                    h[i] = n
 
                 obj_type_label = f"Heading {level}"     # keep Object Type clean
                 new_obj_types.append(obj_type_label)
                 new_obj_texts.append(f"{explicit_label} {clean_text}".strip())
                 continue
 
-            # --- Auto-numbering case ---
-            if raw_type_l == "heading 1":
-                h1 += 1; h2 = h3 = 0
-                label = f"{h1}"
-                new_obj_types.append("Heading 1")
-                new_obj_texts.append(f"{label} {clean_text}".strip())
-            elif raw_type_l == "heading 2":
-                if h1 == 0: h1 = 1
-                h2 += 1; h3 = 0
-                label = f"{h1}.{h2}"
-                new_obj_types.append("Heading 2")
-                new_obj_texts.append(f"{label} {clean_text}".strip())
-            elif raw_type_l == "heading 3":
-                if h1 == 0: h1 = 1
-                if h2 == 0: h2 = 1
-                h3 += 1
-                label = f"{h1}.{h2}.{h3}"
-                new_obj_types.append("Heading 3")
+            # --- Auto-numbering case (or explicit labels ignored) ---
+            # Generic handler for Heading 1..10
+            m_h = re.match(r"heading\s*(\d+)", raw_type_l)
+            if m_h:
+                lvl = max(1, min(10, int(m_h.group(1))))
+                # Ensure parent levels initialized
+                if h[0] == 0:
+                    h[0] = 1
+                for j in range(1, lvl-1):
+                    if h[j] == 0:
+                        h[j] = 1
+                h[lvl-1] += 1
+                for j in range(lvl, 10):
+                    h[j] = 0
+                label = ".".join(str(h[i]) for i in range(lvl))
+                new_obj_types.append(f"Heading {lvl}")
                 new_obj_texts.append(f"{label} {clean_text}".strip())
             else:
                 # Non-heading rows stay the same
@@ -707,10 +985,12 @@ class RequirementDataManager:
     def visible_columns(self) -> List[str]:
         """Columns to show in the grid, prioritized in canonical order. Extra columns follow."""
         if self.dataframe.empty:
-            return self.DEFAULT_COLUMN_ORDER
+            return [c for c in self.DEFAULT_COLUMN_ORDER if c != self.section_column_name]
         ordered = [c for c in self.DEFAULT_COLUMN_ORDER if c in self.dataframe.columns]
         tail = [c for c in self.dataframe.columns if c not in ordered]
-        return [*ordered, *tail]
+        cols = [*ordered, *tail]
+        # Hide the auto-generated section column from the Excel preview/table
+        return [c for c in cols if c != self.section_column_name]
 
 
     # ------------------------------------------------------------------
@@ -818,6 +1098,10 @@ class RequirementDataManager:
 
         numbered = self._apply_section_numbering(df)
         normalized = self._normalize_requirement_records(numbered)
+        # Normalize table captions to be above the table and always present
+        normalized = self._normalize_table_captions(normalized)
+        # Also ensure Figure captions are renumbered; table text is preserved
+        normalized = self._renumber_captions_per_source(normalized)
         return normalized
 
     # ------------------------------------------------------------------
@@ -825,6 +1109,18 @@ class RequirementDataManager:
         """Refresh the in-memory dataframe after edits."""
         self.dataframe = self.finalize_dataframe(self.dataframe)
         return self.dataframe
+
+    # ------------------------------------------------------------------
+    def configure_requirement_patterns_strict(self, mode: str, value: str) -> None:
+        """Strict pattern configuration.
+        - mode 'regex': compile raw expressions (one per line).
+        - mode 'prefixes': build full ID matchers from prefixes (one per line or comma-separated).
+        """
+        mode_l = str(mode or "").strip().lower()
+        if mode_l == "regex":
+            self._custom_patterns = compile_user_patterns(value, manual_regex=True)
+        else:
+            self._custom_patterns = build_requirement_patterns_from_prefixes(value)
 
     # ------------------------------------------------------------------
     def create_empty_dataframe(self) -> pd.DataFrame:
@@ -846,6 +1142,7 @@ class RequirementDataManager:
         front_records: List[Dict[str, str]] = []
         body_started = False
         first_page_done = False
+        seen_req_ids: set[str] = set()
 
         def add_record(payload: Dict[str, str], *, mark_body: bool = False) -> None:
             nonlocal body_started
@@ -857,7 +1154,10 @@ class RequirementDataManager:
 
         blocks = list(self._iter_doc_blocks(document))
         total_blocks = len(blocks)
+        skip_until = 0  # 1-based index in 'blocks' to skip ahead after aggregating requirement text
         for idx, block in enumerate(blocks, 1):
+            if skip_until and idx <= skip_until:
+                continue
             if progress_callback and total_blocks > 0:
                 percent = int((idx / total_blocks) * 100)
                 progress_callback(percent)
@@ -870,9 +1170,13 @@ class RequirementDataManager:
                 except Exception:
                     paragraph_has_boundary = False
 
-                if self._paragraph_has_image(block):
-                    for img_record in self._collect_paragraph_images(block, source_name, sheet_name):
-                        add_record(img_record)
+                try:
+                    has_img = getattr(self, "_paragraph_has_image", None)
+                    if callable(has_img) and has_img(block):
+                        for img_record in self._collect_paragraph_images(block, source_name, sheet_name):
+                            add_record(img_record)
+                except Exception:
+                    pass
 
                 text = block.text.strip()
                 if not text:
@@ -882,21 +1186,217 @@ class RequirementDataManager:
                     LOGGER.debug("Skipping auto-generated section: %s", text[:60])
                     continue
 
-                obj_type = self._classify_paragraph(style_name)
-                req_id, body_text = self._maybe_extract_requirement(text)
+                # First, classify by style name
+                try:
+                    obj_type = self._classify_paragraph(style_name)
+                except AttributeError:
+                    s = (style_name or "").lower()
+                    if "heading 1" in s:
+                        obj_type = "Heading 1"
+                    elif "heading 2" in s:
+                        obj_type = "Heading 2"
+                    elif "heading 3" in s:
+                        obj_type = "Heading 3"
+                    elif "heading 4" in s:
+                        obj_type = "Heading 4"
+                    elif "heading 5" in s:
+                        obj_type = "Heading 5"
+                    elif "heading 6" in s:
+                        obj_type = "Heading 6"
+                    elif "heading 7" in s:
+                        obj_type = "Heading 7"
+                    elif "heading 8" in s:
+                        obj_type = "Heading 8"
+                    elif "heading 9" in s:
+                        obj_type = "Heading 9"
+                    elif "heading 10" in s:
+                        obj_type = "Heading 10"
+                    else:
+                        obj_type = "Requirement"
+
+                # Only treat as list if it is NOT a Heading by style
+                if not str(obj_type).lower().startswith("heading"):
+                    try:
+                        list_meta = self._paragraph_list_info(block, document)
+                    except AttributeError:
+                        list_meta = None
+                    if list_meta:
+                        try:
+                            html_inline = self._paragraph_inlines_to_html(block)
+                        except AttributeError:
+                            html_inline = f"<p>{html.escape(text)}</p>"
+                        add_record({
+                            "Object Type": "Text",
+                            "Requirement ID": "",
+                            "Object Text": text,
+                            "Up Trace": "",
+                            "SourceFile": source_name,
+                            "SheetName": sheet_name,
+                            "SourceType": "docx",
+                            "Attachment Type": "list_item",
+                            "Attachment Data": json.dumps({
+                                "level": int(list_meta.get("level", 1)),
+                                "ordered": bool(list_meta.get("ordered", True)),
+                                "fmt": str(list_meta.get("fmt", "decimal")),
+                                "html": html_inline if html_inline else html.escape(text),
+                            }),
+                        })
+                        if paragraph_has_boundary and not first_page_done:
+                            first_page_done = True
+                        continue
+                try:
+                    req_id, heading_hint, body_text = self._maybe_extract_requirement_strict(text)
+                except AttributeError:
+                    rid = ""; heading_hint = ""; body = text
+                    try:
+                        m = re.match(r"\s*([A-Za-z][A-Za-z0-9_.\-]*\d+)\s*[:\-]\s*(.+)", text)
+                        if not m:
+                            m = re.match(r"\s*([A-Za-z][A-Za-z0-9_.\-]*\d+)\s+(shall|must|should).+", text, flags=re.I)
+                        if m:
+                            rid = clean_id(m.group(1))
+                            body = text[m.end(1):].lstrip(" :-") if m.lastindex and m.lastindex >= 2 else text
+                    except Exception:
+                        rid = ""; body = text
+                    req_id, heading_hint, body_text = rid, "", body
 
                 LOGGER.debug("Paragraph: %s", text[:100])
                 if req_id:
                     LOGGER.debug("  matched Requirement ID: %s", req_id)
 
+                    # Determine which ID to link from heading: prefer next LLR id if present
+                    link_req_id = str(req_id)
+                    j = idx + 1
+                    while j <= total_blocks:
+                        nxt = blocks[j - 1]
+                        from docx.text.paragraph import Paragraph as _P
+                        from docx.table import Table as _T
+                        if isinstance(nxt, _T):
+                            break
+                        if isinstance(nxt, _P):
+                            nxt_text = nxt.text.strip() if nxt.text else ""
+                            if not nxt_text:
+                                j += 1
+                                continue
+                            # Stop at next heading-like or next requirement ID
+                            nxt_style = (nxt.style.name or "").lower()
+                            if nxt_style.startswith("heading"):
+                                break
+                            # Next requirement ID?
+                            rid2, _, _ = self._maybe_extract_requirement_strict(nxt_text)
+                            if rid2:
+                                if "LLR" in str(rid2).upper():
+                                    link_req_id = str(rid2)
+                                break
+                            # Add this paragraph as its own Text row (split by internal newlines)
+                            for line in [ln.strip() for ln in nxt_text.splitlines() if ln.strip()]:
+                                add_record({
+                                    "Object Type": "Text",
+                                    "Requirement ID": "",
+                                    "Object Text": line,
+                                    "Up Trace": "",
+                                    "SourceFile": source_name,
+                                    "SheetName": sheet_name,
+                                    "SourceType": "docx",
+                                    "Attachment Type": "",
+                                    "Attachment Data": "",
+                                }, mark_body=True)
+                            j += 1
+                            continue
+                        break
+                    # Insert heading row (above requirement) with deduped numeric and linked ID
+                    if heading_hint or str(obj_type).lower().startswith("heading"):
+                        heading_text = heading_hint.strip() if heading_hint else str(req_id).strip()
+                        heading_text = heading_text.replace("\n", " ").strip()
+                        heading_text = _dedup_section_label(heading_text)
+                        m_head = re.match(r"^\s*(\d+(?:\.\d+)*)\b", heading_text)
+                        if m_head:
+                            depth = 1 + m_head.group(1).count(".")
+                            depth = max(1, min(depth, 10))
+                            add_record({
+                                "Object Type": f"Heading {depth}",
+                                "Requirement ID": "",
+                                "Object Text": (f"{heading_text} {link_req_id}".strip() if link_req_id else heading_text),
+                                "Up Trace": "",
+                                "SourceFile": source_name,
+                                "SheetName": sheet_name,
+                                "SourceType": "docx",
+                                "Attachment Type": "",
+                                "Attachment Data": "",
+                                "Linked ID / Description": link_req_id,
+                            }, mark_body=True)
+                        else:
+                            add_record({
+                                "Object Type": "Heading",
+                                "Requirement ID": "",
+                                "Object Text": (f"{heading_text} {link_req_id}".strip() if link_req_id else heading_text),
+                                "Up Trace": "",
+                                "SourceFile": source_name,
+                                "SheetName": sheet_name,
+                                "SourceType": "docx",
+                                "Attachment Type": "",
+                                "Attachment Data": "",
+                                "Linked ID / Description": link_req_id,
+                            }, mark_body=True)
+                    # Classify requirement type based on ID token (optional)
+                    obj_req_type = "Requirement"
+                    up_id = str(req_id).upper()
+                    if "LLR" in up_id:
+                        obj_req_type = "Requirement LLR"
+                    elif "HLR" in up_id:
+                        obj_req_type = "Requirement HLR"
+                    elif "-SRS-" in up_id or up_id.endswith("-SRS") or up_id.startswith("SRS-") or " SRS-" in up_id:
+                        obj_req_type = "Requirement System"
+
+                    if str(req_id) in seen_req_ids:
+                        if paragraph_has_boundary and not first_page_done:
+                            first_page_done = True
+                        # Skip duplicate requirement IDs
+                        continue
+                    seen_req_ids.add(str(req_id))
+
+                    add_record({
+                        "Object Type": obj_req_type,
+                        "Requirement ID": req_id,
+                        "Object Text": "",  # keep body in separate Text rows
+                        "Up Trace": "",
+                        "SourceFile": source_name,
+                        "SheetName": sheet_name,
+                        "SourceType": "docx",
+                        "Attachment Type": "",
+                        "Attachment Data": "",
+                    }, mark_body=True)
+                    # Add the immediate body (right-of-ID) as first Text row if present
+                    if body_text and body_text.strip():
+                        for line in [ln.strip() for ln in body_text.splitlines() if ln.strip()]:
+                            add_record({
+                                "Object Type": "Text",
+                                "Requirement ID": "",
+                                "Object Text": line,
+                                "Up Trace": "",
+                                "SourceFile": source_name,
+                                "SheetName": sheet_name,
+                                "SourceType": "docx",
+                                "Attachment Type": "",
+                                "Attachment Data": "",
+                            }, mark_body=True)
+                    if j > idx + 1:
+                        skip_until = j - 1
+                    if paragraph_has_boundary and not first_page_done:
+                        first_page_done = True
+                    continue
+
                 # Fallback: detect numbered headings like "1 Introduction" or "2.3 Scope"
                 # Only treat as heading if it does not look like a TOC entry line
                 if not obj_type.startswith("Heading"):
                     if not self._is_toc_entry_line(text):
-                        m = re.match(r"^\s*(\d+(?:\.\d+)*)\s+\S", text)
+                        # Avoid list/bullet paragraphs being misclassified as headings
+                        if ("list" in style_name) or ("bullet" in style_name) or re.match(r"^\s*([a-zA-Z]|[ivxlcdmIVXLCDM]+)\s*[\).]", text):
+                            m = None
+                        else:
+                            m = re.match(r"^\s*(\d+(?:\.\d+)*)\s+\S", text)
                         if m:
                             depth = 1 + m.group(1).count(".")
-                            depth = max(1, min(depth, 3))
+                            depth = max(1, min(depth, 10))
                             add_record(
                                 {
                                     "Object Type": f"Heading {depth}",
@@ -947,6 +1447,10 @@ class RequirementDataManager:
                         first_page_done = True
                     continue
 
+                try:
+                    html_inline = self._paragraph_inlines_to_html(block)
+                except AttributeError:
+                    html_inline = f"<p>{html.escape(body_text or text)}</p>"
                 add_record({
                     "Object Type": "Text",
                     "Requirement ID": req_id or "",
@@ -955,15 +1459,33 @@ class RequirementDataManager:
                     "SourceFile": source_name,
                     "SheetName": sheet_name,
                     "SourceType": "docx",
-                    "Attachment Type": "",
-                    "Attachment Data": "",
+                    "Attachment Type": "html",
+                    "Attachment Data": html_inline,
                 })
                 if paragraph_has_boundary and not first_page_done:
                     first_page_done = True
                 continue
 
             if isinstance(block, Table):
-                html_table = self._table_to_html(block)
+                try:
+                    html_table = self._table_to_html(block)
+                except AttributeError:
+                    # Fallback simple table converter
+                    try:
+                        rows_html: List[str] = []
+                        for row in block.rows:
+                            cells_html: List[str] = []
+                            for cell in row.cells:
+                                txt = html.escape(cell.text.strip()) if cell.text else "&nbsp;"
+                                cells_html.append(f"<td>{txt}</td>")
+                            rows_html.append("<tr>" + "".join(cells_html) + "</tr>")
+                        html_table = (
+                            '<table border="1" style="border-collapse: collapse; width: 100%;">'
+                            + "".join(rows_html)
+                            + "</table>"
+                        )
+                    except Exception:
+                        html_table = ""
                 if not html_table.strip():
                     continue
                 add_record({
@@ -1071,6 +1593,22 @@ class RequirementDataManager:
             return "Heading 2"
         if "heading 3" in style_lower:
             return "Heading 3"
+        if "heading 4" in style_lower:
+            return "Heading 4"
+        if "heading 5" in style_lower:
+            return "Heading 5"
+        if "heading 6" in style_lower:
+            return "Heading 6"
+        if "heading 7" in style_lower:
+            return "Heading 7"
+        if "heading 8" in style_lower:
+            return "Heading 8"
+        if "heading 9" in style_lower:
+            return "Heading 9"
+        if "heading 10" in style_lower:
+            return "Heading 10"
+        if "list" in style_lower or "bullet" in style_lower:
+            return "Text"
         return "Requirement"
 
     # ------------------------------------------------------------------
@@ -1459,6 +1997,46 @@ class RequirementDataManager:
         return "", text
 
     # ------------------------------------------------------------------
+    def _maybe_extract_requirement_strict(self, text: str) -> tuple[str, str, str]:
+        """Split a paragraph using only user-defined patterns. No default detection.
+        Returns (req_id, heading_hint_left_of_id, body_right_of_id).
+        """
+        text = (text or "").strip()
+        if not text:
+            return "", "", ""
+
+        for pattern in self._custom_patterns:
+            match = pattern.search(text)
+            if match:
+                rid = match.group("id") if "id" in match.groupdict() else match.group(0)
+                # If body not captured, derive it by slicing the text around the ID
+                if "body" in match.groupdict() and match.group("body") is not None:
+                    # Capture any preceding heading hint from the remaining left side
+                    try:
+                        start = match.start("id") if "id" in match.groupdict() else match.start(0)
+                    except Exception:
+                        start = text.find(str(rid)) if str(rid) in text else 0
+                    left = text[:start]
+                    left = re.sub(r"(?i)Requirement\s*(ID|No)\s*[:\-–]?\s*$", "", left).strip()
+                    body = match.group("body")
+                else:
+                    try:
+                        start = match.start("id") if "id" in match.groupdict() else match.start(0)
+                        end = match.end("id") if "id" in match.groupdict() else match.end(0)
+                    except Exception:
+                        start = text.find(str(rid)) if str(rid) in text else 0
+                        end = start + len(str(rid))
+                    left = text[:start]
+                    right = text[end:]
+                    # Strip any 'Requirement ID' label near the ID (left side)
+                    left = re.sub(r"(?i)Requirement\s*(ID|No)\s*[:\-–]?\s*$", "", left).strip()
+                    body = right.strip()
+                LOGGER.debug("Matched custom pattern -> ReqID='%s'", rid)
+                return str(rid).strip(), str(left).strip(), str(body).strip()
+
+        LOGGER.debug("No ReqID match (custom-only) for: %s", text[:80])
+        return "", "", text
+    # ------------------------------------------------------------------
     def _normalize_requirement_records(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty or "Object Text" not in df.columns or "Requirement ID" not in df.columns:
             return df
@@ -1488,6 +2066,69 @@ class RequirementDataManager:
 
         cleaned["Object Text"] = cleaned.apply(_normalize_row, axis=1)
         return cleaned
+
+    # ------------------------------------------------------------------
+    def _normalize_table_captions(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Ensure each table has a caption row immediately above.
+
+        - If a caption is below the table, move it above.
+        - If missing, insert a blank caption row ("Table :") above the table.
+        """
+        if df is None or df.empty:
+            return df
+        work = df.reset_index(drop=True).copy()
+        out_rows: list[dict] = []
+        i = 0
+        n = len(work)
+        def _is_caption(text: str) -> bool:
+            s = str(text or "")
+            return bool(self._TABLE_PREFIX.match(s) or TABLE_NO_ANY_RE.match(s) or re.match(r"^\s*Table\s*:\s*$", s, flags=re.I))
+
+        while i < n:
+            row = work.iloc[i].to_dict()
+            att = str(row.get("Attachment Type", "") or "").lower()
+            if att != "table":
+                out_rows.append(row)
+                i += 1
+                continue
+
+            # Found a table row; determine caption location
+            prev_is_caption = False
+            next_is_caption = False
+            prev_row = out_rows[-1] if out_rows else None
+            if prev_row is not None:
+                if str(prev_row.get("Object Type", "")).lower() == "text" and _is_caption(prev_row.get("Object Text", "")):
+                    prev_is_caption = True
+            if i + 1 < n:
+                nxt = work.iloc[i + 1].to_dict()
+                if str(nxt.get("Object Type", "")).lower() == "text" and _is_caption(nxt.get("Object Text", "")):
+                    next_is_caption = True
+
+            if prev_is_caption:
+                # Caption already above: keep it, append only the table.
+                out_rows.append(row)
+                # If there is also a caption below, skip it to avoid duplicates.
+                i += 2 if next_is_caption else 1
+                continue
+
+            if next_is_caption:
+                # Move the below-caption above the table
+                out_rows.append(nxt)
+                out_rows.append(row)
+                i += 2
+                continue
+
+            # No caption found: insert a minimal placeholder above
+            caption_row = {c: row.get(c, "") for c in work.columns}
+            caption_row["Object Type"] = "Text"
+            caption_row["Object Text"] = "Table :"
+            caption_row["Attachment Type"] = ""
+            caption_row["Attachment Data"] = ""
+            out_rows.append(caption_row)
+            out_rows.append(row)
+            i += 1
+
+        return pd.DataFrame(out_rows, columns=work.columns)
 
     # ------------------------------------------------------------------
     def update_cell(self, row: int, column: str, value: str) -> None:
@@ -1651,6 +2292,89 @@ class RequirementDataManager:
             self.dataframe[col] = ""
             self.dataframe = self._reorder_visible_columns(self.dataframe)
         return col
+
+    # ------------------------------------------------------------------
+    def renumber_headings_from(self, start_index: int, base_label: str) -> pd.DataFrame:
+        """
+        Renumber headings from a given global row index forward, forcing a new
+        numeric base (e.g., "2" or "2.1" or "2.1.1"). This rewrites the
+        Object Text prefixes for Heading 1..6 rows from that index onward and
+        cascades numbering across levels.
+        """
+        df = self.dataframe.copy()
+        if df.empty:
+            return df
+
+        # Validate base label
+        m = re.match(r"^\s*(\d+(?:\.\d+){0,5})\s*$", str(base_label or ""))
+        if not m:
+            raise RequirementDataError("Invalid base label. Use forms like '2', '2.1', '2.1.1'.")
+        parts = [int(p) for p in m.group(1).split('.')]
+
+        # Helpers
+        def level_from_type(ot: str) -> int | None:
+            mm = re.search(r"heading\s*(\d+)", str(ot or ""), re.IGNORECASE)
+            return int(mm.group(1)) if mm else None
+
+        def strip_leading_number(s: str) -> str:
+            s = str(s or '')
+            mm = re.match(r"^\s*\d+(?:\s*\.\s*\d+)*\.?\s*(.*)$", s)
+            return (mm.group(1) if mm else s).strip()
+
+        # Counters for Heading 1..6
+        h = [0, 0, 0, 0, 0, 0]
+        assigned_first = False
+
+        for idx in range(max(0, int(start_index)), len(df)):
+            obj_type = str(df.at[idx, "Object Type"] if "Object Type" in df.columns else "")
+            lvl = level_from_type(obj_type)
+            if not lvl or not (1 <= lvl <= 6):
+                continue
+
+            txt = str(df.at[idx, "Object Text"] if "Object Text" in df.columns else "")
+            clean_txt = strip_leading_number(txt)
+
+            if not assigned_first:
+                # Seed counters from base label; if base has fewer parts than current level,
+                # fill missing deeper parts with 1s so the first occurrence is valid.
+                h = [0, 0, 0, 0, 0, 0]
+                for i, num in enumerate(parts[:6]):
+                    h[i] = num
+                # Ensure length up to current level
+                for j in range(len(parts), lvl):
+                    h[j] = 1
+                label = ".".join(str(h[i]) for i in range(lvl))
+                df.at[idx, "Object Text"] = f"{label} {clean_txt}".strip()
+                assigned_first = True
+                continue
+
+            # Cascade increments depending on the current heading level
+            if lvl == 1:
+                h[0] += 1
+                for j in range(1, 6):
+                    h[j] = 0
+            else:
+                if h[0] == 0:
+                    h[0] = 1
+                # Ensure parents are at least 1
+                for j in range(1, lvl - 1):
+                    if h[j] == 0:
+                        h[j] = 1
+                h[lvl - 1] += 1
+                for j in range(lvl, 6):
+                    h[j] = 0
+            label = ".".join(str(h[i]) for i in range(lvl))
+            df.at[idx, "Object Text"] = f"{label} {clean_txt}".strip()
+
+        # Commit and run finalize to rebuild section column and tidy
+        prev = getattr(self, "ignore_explicit_heading_numbers", False)
+        try:
+            # Ensure we honor the explicit labels we just wrote
+            self.ignore_explicit_heading_numbers = False
+            self.dataframe = self.finalize_dataframe(df)
+        finally:
+            self.ignore_explicit_heading_numbers = prev
+        return self.dataframe
     # ------------------------------------------------------------------
     # --- NEW: build a flattened/exportable dataframe (single row per requirement)
     def build_grouped_export(self) -> pd.DataFrame:
@@ -1869,3 +2593,4 @@ def build_cross_pairs(self, tab_frames: Dict[str, pd.DataFrame]) -> Tuple[list[s
     # navigation prefers From Artifact tab
     row_sources = [r[0] for r in rows]
     return columns, [(a, aid, m, b, bid) for a,aid,b,bid,m in rows], row_sources
+TABLE_NO_ANY_RE = re.compile(r"^\s*Table\s*(?:No\.?|Number)?\s*[:\-]?\s*(\d+)\b", re.IGNORECASE)

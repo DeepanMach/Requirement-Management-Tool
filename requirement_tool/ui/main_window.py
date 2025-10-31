@@ -247,6 +247,104 @@ class ReorderFilesDialog(QDialog):
 LOGGER = logging.getLogger(__name__)
 
 
+class TableEditorDialog(QDialog):
+    """A simple editor for embedded table payloads with merge/split support."""
+    def __init__(self, rows: int, cols: int, data: list[list[str]] | None = None, merges: list[dict] | None = None, parent: QWidget | None = None):
+        super().__init__(parent)
+        from PyQt6.QtWidgets import QVBoxLayout, QHBoxLayout, QPushButton, QDialogButtonBox, QTableWidget, QTableWidgetItem
+        self.setWindowTitle("Edit Embedded Table")
+        self.resize(720, 420)
+        self.table = QTableWidget(max(1, int(rows)), max(1, int(cols)), self)
+        if data:
+            for i in range(min(len(data), self.table.rowCount())):
+                row_data = data[i]
+                for j in range(min(len(row_data), self.table.columnCount())):
+                    self.table.setItem(i, j, QTableWidgetItem(str(row_data[j])))
+        # Apply merges
+        for m in merges or []:
+            try:
+                r = int(m.get("r", 0)); c = int(m.get("c", 0))
+                rs = max(1, int(m.get("rowspan", 1))); cs = max(1, int(m.get("colspan", 1)))
+                self.table.setSpan(r, c, rs, cs)
+            except Exception:
+                pass
+
+        # Controls
+        btn_add_row = QPushButton("Add Row")
+        btn_del_row = QPushButton("Delete Row")
+        btn_add_col = QPushButton("Add Column")
+        btn_del_col = QPushButton("Delete Column")
+        btn_merge   = QPushButton("Merge Cells")
+        btn_unmerge = QPushButton("Unmerge")
+
+        def add_row():
+            self.table.insertRow(self.table.currentRow() + 1 if self.table.currentRow() >= 0 else self.table.rowCount())
+        def del_row():
+            r = self.table.currentRow()
+            if r >= 0:
+                self.table.removeRow(r)
+        def add_col():
+            self.table.insertColumn(self.table.currentColumn() + 1 if self.table.currentColumn() >= 0 else self.table.columnCount())
+        def del_col():
+            c = self.table.currentColumn()
+            if c >= 0:
+                self.table.removeColumn(c)
+        def merge_sel():
+            ranges = self.table.selectedRanges()
+            if not ranges:
+                return
+            r = ranges[0]
+            self.table.setSpan(r.topRow(), r.leftColumn(), r.rowCount(), r.columnCount())
+        def unmerge_sel():
+            ranges = self.table.selectedRanges()
+            if not ranges:
+                return
+            r = ranges[0]
+            for i in range(r.topRow(), r.bottomRow() + 1):
+                for j in range(r.leftColumn(), r.rightColumn() + 1):
+                    self.table.setSpan(i, j, 1, 1)
+
+        btn_add_row.clicked.connect(add_row)
+        btn_del_row.clicked.connect(del_row)
+        btn_add_col.clicked.connect(add_col)
+        btn_del_col.clicked.connect(del_col)
+        btn_merge.clicked.connect(merge_sel)
+        btn_unmerge.clicked.connect(unmerge_sel)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+
+        top_btns = QHBoxLayout()
+        for b in (btn_add_row, btn_del_row, btn_add_col, btn_del_col, btn_merge, btn_unmerge):
+            top_btns.addWidget(b)
+        layout = QVBoxLayout(self)
+        layout.addLayout(top_btns)
+        layout.addWidget(self.table, 1)
+        layout.addWidget(button_box)
+
+    def result_payload(self) -> tuple[int, int, list[list[str]], list[dict]]:
+        from PyQt6.QtWidgets import QTableWidgetItem
+        rows = self.table.rowCount()
+        cols = self.table.columnCount()
+        data: list[list[str]] = [[""] * cols for _ in range(rows)]
+        for i in range(rows):
+            for j in range(cols):
+                it = self.table.item(i, j)
+                data[i][j] = (it.text().strip() if isinstance(it, QTableWidgetItem) and it is not None else "")
+        merges: list[dict] = []
+        try:
+            for i in range(rows):
+                for j in range(cols):
+                    rs = self.table.rowSpan(i, j)
+                    cs = self.table.columnSpan(i, j)
+                    if rs > 1 or cs > 1:
+                        merges.append({"r": i, "c": j, "rowspan": rs, "colspan": cs})
+        except Exception:
+            pass
+        return rows, cols, data, merges
+
+
 ASSETS_DIR = (Path(__file__).resolve().parent / "assets")
 ASSETS_DIR.mkdir(exist_ok=True)
 DEFAULT_HOWELL_LOGO = str(ASSETS_DIR / "howell_logo.png")
@@ -273,22 +371,38 @@ class RequirementPatternDialog(QDialog):
         layout.addLayout(form)
 
         self.mode_combo = QComboBox(self)
-        self.mode_combo.addItem("Prefixes (comma-separated)", "prefixes")
-        self.mode_combo.addItem("Custom Regular Expression", "regex")
+        self.mode_combo.addItem("Prefixes (comma/line separated)", "prefixes")
+        self.mode_combo.addItem("Manual Regular Expressions (one per line)", "regex")
         index = self.mode_combo.findData(mode)
         if index >= 0:
             self.mode_combo.setCurrentIndex(index)
 
-        self.value_edit = QLineEdit(value, self)
+        self.value_edit = QTextEdit(self)
+        self.value_edit.setPlainText(value)
+        self.value_edit.setPlaceholderText("")
         self._update_placeholder()
         self.mode_combo.currentIndexChanged.connect(self._update_placeholder)
 
         form.addRow("Pattern Type", self.mode_combo)
-        form.addRow("Pattern Value", self.value_edit)
+        form.addRow("Pattern Lines", self.value_edit)
+
+        # Preview area
+        preview_row = QHBoxLayout()
+        self.preview_btn = QPushButton("Preview Patterns", self)
+        self.preview_btn.clicked.connect(self._preview_patterns)
+        preview_row.addWidget(self.preview_btn)
+        preview_row.addStretch(1)
+        layout.addLayout(preview_row)
+
+        self.preview_edit = QTextEdit(self)
+        self.preview_edit.setReadOnly(True)
+        self.preview_edit.setFixedHeight(100)
+        layout.addWidget(self.preview_edit)
 
         self.help_label = QLabel(
-            "Prefixes example: REQ, SWR\n"
-            "Regex example: ^\\s*(?P<id>REQ\\d+)\\s*[:\\-]\\s*(?P<body>.+)$",
+            "Enter one pattern per line.\n"
+            "- Literal mode: lines are matched as-is (escaped).\n"
+            "- Regex mode: lines are raw regex; optional named groups: 'id' and 'body'.",
             self,
         )
         self.help_label.setWordWrap(True)
@@ -305,14 +419,38 @@ class RequirementPatternDialog(QDialog):
     def _update_placeholder(self) -> None:
         mode = self.mode_combo.currentData()
         if mode == "regex":
-            self.value_edit.setPlaceholderText("Enter custom regular expression")
+            self.value_edit.setPlaceholderText("Regex mode: one per line, e.g. ^(?P<id>REQ-\\d{3})\\b(?P<body>.*)$")
         else:
-            self.value_edit.setPlaceholderText("e.g. REQ, SWR, SYS")
+            self.value_edit.setPlaceholderText("Literal mode: one per line, e.g. REQ-1234")
+
+    def _preview_patterns(self) -> None:
+        raw = self.value_edit.toPlainText()
+        mode = str(self.mode_combo.currentData())
+        out: list[str] = []
+        try:
+            if mode == "regex":
+                import re as _re
+                lines = [ln.strip() for ln in str(raw or "").replace(",", "\n").splitlines() if ln.strip()]
+                for idx, line in enumerate(lines, start=1):
+                    try:
+                        rx = _re.compile(line)
+                        out.append(f"{line} → {rx.pattern}")
+                    except Exception as exc:
+                        out.append(f"[ERROR] line {idx}: {line} -> {exc}")
+            else:
+                # Prefix mode: show the auto-built patterns
+                try:
+                    from requirement_tool.data_manager import preview_prefix_patterns
+                    out = preview_prefix_patterns(raw)
+                except Exception as exc:
+                    out = [f"[ERROR] preview: {exc}"]
+        finally:
+            self.preview_edit.setPlainText("\n".join(out))
 
     def result_config(self) -> dict[str, str]:
         return {
             "mode": str(self.mode_combo.currentData()),
-            "value": self.value_edit.text().strip(),
+            "value": self.value_edit.toPlainText().strip(),
         }
 
 
@@ -399,7 +537,8 @@ class RestoreWorker(QThread):
 
             # Word load
             if self._word_files:
-                mgr.configure_requirement_pattern(self._word_pattern)
+                cfg = self._word_pattern or {}
+                mgr.configure_requirement_patterns_strict(cfg.get("mode", "prefixes"), cfg.get("value", ""))
                 all_dfs = []
                 total_reqs = 0
                 # Aggregate front-matter metadata across files because
@@ -419,7 +558,8 @@ class RestoreWorker(QThread):
 
                     df_part = mgr.load_word_documents([path], progress_callback=update_progress, interactive=False)
                     all_dfs.append(df_part)
-                    total_reqs += df_part["Object Type"].str.lower().eq("requirement").sum()
+                    # Count requirements by non-empty 'Requirement ID'
+                    total_reqs += df_part.get("Requirement ID", pd.Series(dtype=str)).astype(str).str.strip().ne("").sum()
                     # Merge front-matter records from this pass
                     try:
                         for k, v in getattr(mgr, 'front_matter_records', {}).items():
@@ -490,7 +630,8 @@ class ImportWorker(QThread):
                 self.progress.emit(int(completed / total_steps * 100), "Excel loaded")
 
             if self._word_files:
-                mgr.configure_requirement_pattern(self._word_pattern)
+                cfg = self._word_pattern or {}
+                mgr.configure_requirement_patterns_strict(cfg.get("mode", "prefixes"), cfg.get("value", ""))
                 all_dfs = []
                 total_reqs = 0
                 for path in self._word_files:
@@ -506,7 +647,8 @@ class ImportWorker(QThread):
 
                     df_part = mgr.load_word_documents([path], progress_callback=update_progress, interactive=False)
                     all_dfs.append(df_part)
-                    total_reqs += df_part["Object Type"].str.lower().eq("requirement").sum()
+                    # Count requirements by non-empty 'Requirement ID'
+                    total_reqs += df_part.get("Requirement ID", pd.Series(dtype=str)).astype(str).str.strip().ne("").sum()
                     completed += 1
                     self.progress.emit(int(completed / total_steps * 100), f"Parsed {Path(path).name}")
 
@@ -611,7 +753,7 @@ class ExcelTab(QWidget):
                     else:
                         self._model.setItem(r, ci, QStandardItem("[Missing Image]"))
                 elif is_table_marker(val):
-                    rows, cols2, data, name = load_table_payload(val)
+                    rows, cols2, data, name, merges = load_table_payload(val)
                     lbl = f"{name} ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â " if name else ""
                     self._model.setItem(r, ci, QStandardItem(f"{lbl}Table {rows}x{cols2}"))
                 else:
@@ -1150,7 +1292,7 @@ class MainWindow(QMainWindow):
         self.preview_front_btn.clicked.connect(self.preview_front_page_only)
         self.remove_tab_btn = QPushButton("Remove Tab")
         self.remove_tab_btn.clicked.connect(self.remove_current_tab)
-        # Initialize preference before the checkbox references it
+        # Initialize preference(s)
         if not hasattr(self, "combine_word_tabs"):
             self.combine_word_tabs = True
         # Option toggle for combining Word tabs
@@ -1166,8 +1308,27 @@ class MainWindow(QMainWindow):
             self.remove_tab_btn,
         ):
             attachment_row.addWidget(button)
+        # Removed paged preview checkbox; paged preview is automatic when WebEngine is available
         attachment_row.addStretch()
+        # Option: ignore imported heading numbers and re-number from Object Type
+        self.ignore_heading_numbers_chk = QCheckBox("Ignore Imported Heading Numbers")
+        try:
+            self.ignore_heading_numbers_chk.setChecked(bool(getattr(self.data_manager, 'ignore_explicit_heading_numbers', False)))
+        except Exception:
+            self.ignore_heading_numbers_chk.setChecked(True)
+        def _toggle_ignore(v: bool) -> None:
+            try:
+                self.data_manager.ignore_explicit_heading_numbers = bool(v)
+                refreshed = self.data_manager.refresh_dataframe()
+                self._undo_stack.append(refreshed.copy())
+                self.populate_table()
+                if self.view_stack.currentWidget() is self.word_preview or (self.web_preview is not None and self.use_paged_preview):
+                    self.update_word_preview()
+            except Exception:
+                pass
+        self.ignore_heading_numbers_chk.toggled.connect(_toggle_ignore)
         attachment_row.addWidget(self.combine_word_chk)
+        attachment_row.addWidget(self.ignore_heading_numbers_chk)
         main_layout.addLayout(attachment_row)
 
 
@@ -1267,7 +1428,24 @@ class MainWindow(QMainWindow):
         self.view_stack.addWidget(self.table_tabs)
 
         self.word_preview = QTextBrowser()
+        try:
+            self.word_preview.setOpenExternalLinks(True)
+            self.word_preview.setOpenLinks(True)
+        except Exception:
+            pass
         self.view_stack.addWidget(self.word_preview)
+        # Optional WebEngine-based paged preview
+        self.web_preview = None
+        self.use_paged_preview = False
+        try:
+            from PyQt6.QtWebEngineWidgets import QWebEngineView  # type: ignore
+            self.web_preview = QWebEngineView()
+            self.view_stack.addWidget(self.web_preview)
+            # WebEngine available: force paged preview ON
+            self.use_paged_preview = True
+        except Exception:
+            self.web_preview = None
+            # Fallback: QTextBrowser without true pagination
 
         self.trace_view = TraceMatrixView(self)
         self.trace_view.navigate_to_requirement = self.navigate_to_requirement
@@ -1286,7 +1464,7 @@ class MainWindow(QMainWindow):
         self._table_sort: Dict[str, tuple[int, bool]] = {}
         # Object Type options for the in-grid dropdown
         self._object_types: list[str] = [
-            "Heading 1", "Heading 2", "Heading 3",
+            "Heading 1", "Heading 2", "Heading 3", "Heading 4", "Heading 5", "Heading 6",
             "Requirement", "Image", "Table", "Text"
         ]
 
@@ -1365,6 +1543,7 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         act_img       = menu.addAction("Insert Image")
         act_tbl       = menu.addAction("Insert Table")
+        act_edit_tbl  = menu.addAction("Edit Embedded Table…")
         menu.addSeparator()
         act_hide_col  = menu.addAction("Hide Column")
         act_show_cols = menu.addAction("Show All Columns")
@@ -1490,6 +1669,7 @@ class MainWindow(QMainWindow):
             act_show_rows.triggered.connect(show_all_rows)
             act_undo.triggered.connect(do_undo)
             act_preview.triggered.connect(open_preview)
+            act_edit_tbl.triggered.connect(lambda: self._open_table_editor_at_rowindex(table, row))
 
             menu.exec(table.viewport().mapToGlobal(pos))
 
@@ -1522,6 +1702,93 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.log_console(f'Opened project context: {name}')
+
+    # ---------------- Table editing helpers ----------------
+    def _is_table_caption_text(self, text: str) -> bool:
+        import re as _re
+        return bool(_re.match(r"^\s*Table\s*(?:No\.?|Number)?\s*[:\-]?\s*\d+", str(text or ""), flags=_re.I))
+
+    def _html_table_to_payload(self, html_table: str) -> tuple[int, int, list[list[str]], list[dict]]:
+        try:
+            from bs4 import BeautifulSoup
+        except Exception:
+            return (0, 0, [], [])
+        soup = BeautifulSoup(html_table or "", "html.parser")
+        rows = soup.find_all("tr")
+        if not rows:
+            return (0, 0, [], [])
+        max_cols = 0
+        data: list[list[str]] = []
+        merges: list[dict] = []
+        for i, r in enumerate(rows):
+            cells = r.find_all(["td", "th"]) or []
+            row_vals: list[str] = []
+            j_index = 0
+            for cell in cells:
+                txt = cell.get_text(separator="\n").strip()
+                row_vals.append(txt)
+                try:
+                    rs = int(cell.get("rowspan", 1))
+                    cs = int(cell.get("colspan", 1))
+                    if rs > 1 or cs > 1:
+                        merges.append({"r": i, "c": j_index, "rowspan": rs, "colspan": cs})
+                except Exception:
+                    pass
+                j_index += 1
+            max_cols = max(max_cols, len(row_vals))
+            data.append(row_vals)
+        # pad ragged
+        for r in data:
+            if len(r) < max_cols:
+                r += [""] * (max_cols - len(r))
+        return (len(data), max_cols, data, merges)
+
+    def _open_table_editor_at_rowindex(self, grid: QTableWidget, view_row: int) -> None:
+        if view_row < 0:
+            QMessageBox.information(self, "No selection", "Select a row first.")
+            return
+        source = str(grid.property("source") or "")
+        indices = self._tab_indices.get(source, [])
+        if not indices or view_row >= len(indices):
+            QMessageBox.information(self, "Unavailable", "Could not locate the selected row in the dataset.")
+            return
+        df = self.data_manager.dataframe.copy()
+        target = int(indices[view_row])
+        # If caption text row, target the next row if it is a table
+        try:
+            txt = str(df.at[target, "Object Text"]) if "Object Text" in df.columns else ""
+        except Exception:
+            txt = ""
+        if str(df.at[target, "Attachment Type"] if "Attachment Type" in df.columns else "").lower() != "table":
+            if self._is_table_caption_text(txt) and target + 1 < len(df) and str(df.at[target + 1, "Attachment Type"]).lower() == "table":
+                target = target + 1
+            else:
+                QMessageBox.information(self, "Not a table", "Pick a table row or its caption to edit.")
+                return
+
+        payload = str(df.at[target, "Attachment Data"]) if "Attachment Data" in df.columns else ""
+        rows = cols = 0
+        data: list[list[str]] = []
+        merges: list[dict] = []
+        if is_table_marker(payload):
+            rows, cols, data, _name, merges = load_table_payload(payload)
+        else:
+            rows, cols, data, merges = self._html_table_to_payload(payload)
+
+        dlg = TableEditorDialog(rows, cols, data, merges, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        r2, c2, d2, m2 = dlg.result_payload()
+        # Keep existing name if present as caption text
+        name = str(df.at[target - 1, "Object Text"]) if target - 1 >= 0 and self._is_table_caption_text(df.at[target - 1, "Object Text"]) else ""
+        marker = save_table_payload(r2, c2, d2, name=name, merges=m2)
+        df.at[target, "Attachment Type"] = "table"
+        df.at[target, "Attachment Data"] = marker
+        finalized = self.data_manager.finalize_dataframe(df)
+        self.data_manager.dataframe = finalized
+        self._undo_stack.append(finalized.copy())
+        self.populate_table()
+        self.log_console("Table updated.")
 
     def create_project(self) -> None:
         """Project creation is handled in Main Page UI. No auto-creation of Manual tab."""
@@ -1917,7 +2184,7 @@ class MainWindow(QMainWindow):
             return
 
         cfg = pattern if (pattern and pattern.get("value")) else self._last_pattern_config
-        self.data_manager.configure_requirement_pattern(cfg)
+        self.data_manager.configure_requirement_patterns_strict(cfg.get("mode", "prefixes"), cfg.get("value", ""))
 
         # Reset front page handling state for this import
         self.data_manager.skip_front_matter_for_word = False
@@ -2768,7 +3035,7 @@ class MainWindow(QMainWindow):
                 else:
                     self.log_console(f"Could not find heading: {fallback}")
 
-            QTimer.singleShot(0, navigate_preview)
+            QTimer.singleShot(50, navigate_preview)
             return
 
         self.log_console(f"Navigated to: {text_value}")
@@ -2814,6 +3081,12 @@ class MainWindow(QMainWindow):
                 self._loading = False
             return
 
+        # If auto-renumber is set, apply before refresh
+        try:
+            if getattr(self, "_auto_renumber_from_index", None) is not None and str(getattr(self, "_auto_renumber_base", "")).strip():
+                self.data_manager.renumber_headings_from(int(self._auto_renumber_from_index), str(self._auto_renumber_base))
+        except Exception:
+            pass
         refreshed = self.data_manager.refresh_dataframe()
         self._undo_stack.append(refreshed.copy())
         self.populate_table()
@@ -2826,6 +3099,10 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         add_row = menu.addAction("Add Row Below")
         delete_row = menu.addAction("Delete Row")
+        menu.addSeparator()
+        renum_here = menu.addAction("Renumber Headings From Here…")
+        auto_renum = menu.addAction("Set Auto-Renumber From Here…")
+        clear_auto = menu.addAction("Clear Auto-Renumber")
         action = menu.exec(table.viewport().mapToGlobal(position))
 
         if action is None:
@@ -2844,6 +3121,34 @@ class MainWindow(QMainWindow):
             current_row = table.currentRow()
             if 0 <= current_row < len(indices):
                 self._delete_rows([indices[current_row]])
+        elif action == renum_here:
+            indices = self._tab_indices.get(source, [])
+            current_row = table.currentRow()
+            if 0 <= current_row < len(indices):
+                start_index = int(indices[current_row])
+                base, ok = QInputDialog.getText(self, "Renumber Headings", "Start label (e.g., 2, 2.1, 2.1.1):", text="1")
+                if ok and str(base).strip():
+                    try:
+                        df2 = self.data_manager.renumber_headings_from(start_index, str(base).strip())
+                        self._undo_stack.append(df2.copy())
+                        self.populate_table()
+                        self.update_word_preview()
+                    except Exception as exc:
+                        QMessageBox.warning(self, "Renumber", f"Failed to renumber: {exc}")
+        elif action == auto_renum:
+            indices = self._tab_indices.get(source, [])
+            current_row = table.currentRow()
+            if 0 <= current_row < len(indices):
+                start_index = int(indices[current_row])
+                base, ok = QInputDialog.getText(self, "Auto-Renumber", "Start label for ongoing edits:", text="1")
+                if ok and str(base).strip():
+                    self._auto_renumber_from_index = start_index
+                    self._auto_renumber_base = str(base).strip()
+                    self.log_console(f"Auto-renumber set from row {start_index} with base '{self._auto_renumber_base}'.")
+        elif action == clear_auto:
+            self._auto_renumber_from_index = None
+            self._auto_renumber_base = ""
+            self.log_console("Auto-renumber cleared.")
 
     # ------------------------------------------------------------------
     def add_image_attachment(self) -> None:
@@ -2972,7 +3277,7 @@ class MainWindow(QMainWindow):
         self.log_console("Header details updated.")
         if self.view_stack.currentWidget() is self.word_preview:
             df = self._get_dataframe_for_source(source, raw=True)
-            self.word_preview.setHtml(self.compose_preview_html(df))
+            self.word_preview.setHtml(self.compose_preview_html(df, paged=getattr(self, "use_paged_preview", False)))
 
     def _front_page_base_styles(self) -> str:
         return """
@@ -3230,7 +3535,7 @@ class MainWindow(QMainWindow):
         m = re.search(r"heading\s*\d+\s*-\s*([0-9.]+)", str(obj_type or ""), re.IGNORECASE)
         return m.group(1).strip() if m else ""
 
-    def compose_preview_html(self, df: Optional[pd.DataFrame] = None) -> str:
+    def compose_preview_html(self, df: Optional[pd.DataFrame] = None, *, paged: Optional[bool] = None) -> str:
         df_raw = df.copy() if df is not None else self._get_dataframe_for_source(raw=True)
         if df_raw.empty:
             local_df = pd.DataFrame()
@@ -3241,6 +3546,13 @@ class MainWindow(QMainWindow):
         styles = """
         <style>
             body { font-family: Arial, sans-serif; font-size: 11pt; color: #000; margin: 20px; }
+            /* Make headings clearly larger than body */
+            h1 { font-family: Arial, sans-serif; font-weight: 700; font-size: 18pt; }
+            h2 { font-family: Arial, sans-serif; font-weight: 700; font-size: 16pt; }
+            h3 { font-family: Arial, sans-serif; font-weight: 700; font-size: 14pt; }
+            h4 { font-family: Arial, sans-serif; font-weight: 700; font-size: 13pt; }
+            h5 { font-family: Arial, sans-serif; font-weight: 700; font-size: 12.5pt; }
+            h6 { font-family: Arial, sans-serif; font-weight: 700; font-size: 12pt; }
             .front-page { border: 2px solid #000; padding: 28px; margin-bottom: 36px; }
             .front-title { text-align: center; font-size: 18pt; font-weight: bold; margin-bottom: 12px; }
             .meta-lines { text-align: center; font-size: 12pt; margin-bottom: 16px; }
@@ -3263,17 +3575,31 @@ class MainWindow(QMainWindow):
             .toc-item { margin-left: 8px; line-height: 1.4; }
             .toc-item.level-2 { margin-left: 24px; }
             .toc-item.level-3 { margin-left: 40px; }
+            /* TOC/LOF/LOT links: neutral (not blue/underline) */
             .toc-item a { color: #000; text-decoration: none; }
-            .toc-item a:hover { text-decoration: underline; }
+            .toc-section ol a { color: #000; text-decoration: none; }
+            /* Paragraph/body hyperlinks: blue + underline */
+            a { color: #0645AD; text-decoration: underline; }
+            a:hover { text-decoration: underline; }
             .requirement-id { font-weight: bold; margin-top: 16px; margin-bottom: 4px; }
             .requirement-text { margin-top: 0; text-align: left; line-height: 1.5; }
-            .body-text { text-align: left; line-height: 1.5; margin-bottom: 12px; }
+            .body-text { text-align: left; line-height: 1.5; margin-bottom: 12px; white-space: pre-wrap; }
             table { margin: 12px auto; border-collapse: collapse; width: 100%; }
             table, td, th { border: 1px solid #000; padding: 4px; }
             .table-block { text-align: center; margin: 16px 0; }
             .image-block { text-align: center; margin: 16px 0; }
             .caption { font-style: italic; font-size: 10pt; margin-top: 6px; text-align: center; }
             .existing-front-page { border-style: dashed; }
+            /* Screen paged frame (used when paged mode is on) */
+            .page-frame { position: relative; width: 210mm; margin: 10mm auto; background: #fff; border: 1px solid #000; padding: 12mm 14mm 16mm 14mm; box-shadow: 0 0 6px rgba(0,0,0,.2); }
+            .page-header { border-bottom: 1px solid #000; padding-bottom: 6px; margin-bottom: 10mm; text-align: center; font-weight: 600; }
+            .page-footer { border-top: 1px solid #000; padding-top: 6px; margin-top: 10mm; text-align: center; font-size: 10pt; color: #333; }
+            .page-title { font-size: 14pt; }
+            .page-meta { font-size: 10pt; }
+            .hr-split { border-top:1px solid #555; margin:18px 0; }
+            .page-body { height: 230mm; overflow: hidden; }
+            .wm-overlay { position:absolute; top:50%; left:50%; transform:translate(-50%, -50%) rotate(-35deg); color:#7F7F7F; opacity:0.25; font-family:Arial,sans-serif; font-weight:700; font-size:clamp(48px,12vw,160px); white-space:nowrap; pointer-events:none; user-select:none; }
+            #pages { width: 210mm; margin: 0 auto; }
         </style>
         """
         wm_text = str(settings.get("watermark_text", "") or "").strip()
@@ -3287,7 +3613,7 @@ class MainWindow(QMainWindow):
         # Watermark overlay for preview (diagonal, gray, auto-size) — preview only
         wm_text = str(settings.get("watermark_text", "") or "").strip()
         wm_div = (
-            f"<div style='position:fixed;top:50%;left:50%;transform:translate(-50%, -50%) rotate(-35deg);"
+            f"<div id='wm-global' style='position:fixed;top:50%;left:50%;transform:translate(-50%, -50%) rotate(-35deg);"
             f"color:#7F7F7F;opacity:0.25;font-family:Arial,sans-serif;font-weight:700;"
             f"font-size:clamp(48px,12vw,160px);white-space:nowrap;z-index:9999;pointer-events:none;user-select:none;'>"
             f"{html.escape(wm_text)}</div>"
@@ -3300,20 +3626,36 @@ class MainWindow(QMainWindow):
         body_parts: list[str] = []
         figure_count = table_count = 0
         skip_indices: set[int] = set()
+
+        def _strip_caption_prefix(kind: str, s: str) -> str:
+            try:
+                import re as _re
+                pat = r"^\s*(%s|%s\.)\s*\d+\s*[:\-\.]?\s*" % (
+                    ("table" if kind == "table" else "figure"),
+                    ("tbl" if kind == "table" else "fig")
+                )
+                return _re.sub(pat, "", s, flags=_re.I)
+            except Exception:
+                return s
         section_col = getattr(self.data_manager, "section_column_name", "Section Number")
 
         def _guess_caption(start_idx: int, kind: str) -> tuple[str, Optional[int]]:
+            """Find nearby caption text for images/tables. Prefer above for tables, below for figures."""
             limit = len(local_df)
-            for offset in range(start_idx + 1, min(limit, start_idx + 6)):
-                row_next = local_df.iloc[offset]
-                next_text = str(row_next.get("Object Text", "") or "").strip()
+            offsets = list(range(1, 6))
+            search = ([start_idx - d for d in offsets] + [start_idx + d for d in offsets]) if kind == "table" else ([start_idx + d for d in offsets] + [start_idx - d for d in offsets])
+            for j in search:
+                if j < 0 or j >= limit:
+                    continue
+                row_n = local_df.iloc[j]
+                next_text = str(row_n.get("Object Text", "") or "").strip()
                 if not next_text:
                     continue
                 lower = next_text.lower()
                 if kind == "figure" and lower.startswith("figure"):
-                    return next_text, offset
+                    return next_text, j
                 if kind == "table" and lower.startswith("table"):
-                    return next_text, offset
+                    return next_text, j
             return "", None
 
         # Determine and skip front-matter rows for ALL sources to avoid duplicating front content
@@ -3353,6 +3695,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        first_heading_written = False
         for idx, row in local_df.iterrows():
             if idx in skip_indices:
                 continue
@@ -3371,7 +3714,20 @@ class MainWindow(QMainWindow):
             if not section:
                 m = re.match(r"^\s*(\d+(?:\.\d+)*)\s+", text)
                 section = m.group(1) if m else ""
-            heading_text = (f"{section} {text}".strip() if section else text or "Heading")
+            # Build heading text without duplicating numeric prefix
+            # If Object Text already begins with the same section number, don't prepend it again.
+            heading_text = text or "Heading"
+            if section:
+                import re as _re
+                m = _re.match(r"^\s*(\d+(?:\.\d+)*)\s+(.*)$", heading_text)
+                if m:
+                    head_num, rest = m.group(1), m.group(2)
+                    if head_num == section:
+                        heading_text = f"{head_num} {rest}".strip()
+                    else:
+                        heading_text = f"{section} {rest}".strip()
+                else:
+                    heading_text = f"{section} {heading_text}".strip()
             # ----------------------------------
 
             # --- Headings ---
@@ -3379,7 +3735,36 @@ class MainWindow(QMainWindow):
                 level = _heading_level_from_type(obj_type) or 1
                 level = max(1, min(level, 9))
                 heading_id = f"row-{global_idx}"
-                body_parts.append(f'<h{level} id="{heading_id}">{html.escape(heading_text)}</h{level}>')
+                # De-duplicate repeated section numbers in the rendered text
+                try:
+                    import re as _re
+                    m = _re.match(r"^\s*(\d+(?:\.\d+)*)\s+\1\b(.*)$", heading_text)
+                    if m:
+                        heading_text = f"{m.group(1)}{m.group(2)}".strip()
+                except Exception:
+                    pass
+                # Ensure no newline between section and ID
+                heading_text = heading_text.replace("\n", " ").strip()
+                # Insert split line BEFORE every heading (including the first)
+                body_parts.append("<div class=\"hr-split\"></div>")
+                first_heading_written = True
+                # If heading row carries a linked requirement ID, append it as an underlined hyperlink
+                linked_req = str(row.get("Linked ID / Description", "") or "").strip()
+                if linked_req:
+                    safe_id = re.sub(r'[^A-Za-z0-9_.-]+', '-', linked_req)
+                    rid_href = f'#rid-{safe_id}'
+                    # Avoid duplicating the ID text if it's already in heading_text
+                    if linked_req.lower() not in heading_text.lower():
+                        heading_display = f"{html.escape(heading_text)} " + f'<a href="{rid_href}" style="text-decoration:underline">{html.escape(linked_req)}</a>'
+                    else:
+                        # Replace bare ID substring with link
+                        try:
+                            heading_display = re.sub(re.escape(linked_req), f'<a href="{rid_href}" style="text-decoration:underline">{html.escape(linked_req)}</a>', html.escape(heading_text), flags=re.I)
+                        except Exception:
+                            heading_display = html.escape(heading_text)
+                else:
+                    heading_display = html.escape(heading_text)
+                body_parts.append(f'<h{level} id="{heading_id}">{heading_display}</h{level}>')
                 toc_entries.append({"level": level, "id": heading_id, "title": heading_text})
                 continue
 
@@ -3394,10 +3779,47 @@ class MainWindow(QMainWindow):
                 if caption_idx is not None:
                     skip_indices.add(caption_idx)
                 if not caption_text:
-                    caption_text = f"Table {table_count}"
-                body_parts.append(f'<div id="{table_id}" class="table-block">{attachment_data}')
-                body_parts.append(f'<div class="caption">Table {table_count}: {html.escape(caption_text)}</div></div>')
-                table_entries.append({"id": table_id, "title": f"Table {table_count}: {caption_text}"})
+                    caption_text = "Table :"
+
+                # If the attachment data is a marker, build HTML with row/colspans
+                table_html_block = attachment_data
+                try:
+                    if is_table_marker(attachment_data):
+                        rows_t, cols_t, data_t, name_t, merges_t = load_table_payload(attachment_data)
+                        span_map = {}
+                        covered = set()
+                        for m in merges_t or []:
+                            rr = int(m.get("r", 0)); cc = int(m.get("c", 0))
+                            rs = max(1, int(m.get("rowspan", 1)))
+                            cs = max(1, int(m.get("colspan", 1)))
+                            span_map[(rr, cc)] = (rs, cs)
+                            for ii in range(rr, rr+rs):
+                                for jj in range(cc, cc+cs):
+                                    if (ii, jj) != (rr, cc):
+                                        covered.add((ii, jj))
+                        rows_html = ["<table border='1' cellspacing='0' cellpadding='6' style='border-collapse:collapse;width:100%;'>"]
+                        for i2 in range(max(1, int(rows_t))):
+                            rows_html.append("<tr>")
+                            for j2 in range(max(1, int(cols_t))):
+                                if (i2, j2) in covered:
+                                    continue
+                                cell = ""
+                                try:
+                                    cell = html.escape(str(data_t[i2][j2]))
+                                except Exception:
+                                    cell = ""
+                                rs, cs = span_map.get((i2, j2), (1, 1))
+                                span_attr = (f" rowspan='{rs}'" if rs > 1 else "") + (f" colspan='{cs}'" if cs > 1 else "")
+                                rows_html.append(f"<td{span_attr}>{cell}</td>")
+                            rows_html.append("</tr>")
+                        rows_html.append("</table>")
+                        table_html_block = "".join(rows_html)
+                except Exception:
+                    table_html_block = attachment_data
+
+                body_parts.append(f'<div id="{table_id}" class="table-block">{table_html_block}')
+                body_parts.append(f'<div class="caption">{html.escape(caption_text)}</div></div>')
+                table_entries.append({"id": table_id, "title": f"{caption_text}"})
                 continue
 
             # --- Images ---
@@ -3424,6 +3846,8 @@ class MainWindow(QMainWindow):
                     skip_indices.add(caption_idx)
                 if not caption_text:
                     caption_text = f"Figure {figure_count}"
+                else:
+                    caption_text = _strip_caption_prefix("figure", caption_text)
                 width_percent = settings.get("preview_image_width_percent", 80)
                 body_parts.append(
                     f'<div id="{figure_id}" class="image-block"><img src="data:{mime};base64,{image_data}" '
@@ -3431,6 +3855,18 @@ class MainWindow(QMainWindow):
                 )
                 body_parts.append(f'<div class="caption">Figure {figure_count}: {html.escape(caption_text)}</div>')
                 figure_entries.append({"id": figure_id, "title": f"Figure {figure_count}: {caption_text}"})
+                continue
+
+            # --- HTML paragraphs (from Word inlines) ---
+            if attachment_type == "html" and attachment_data:
+                try:
+                    import re as _re
+                    block = str(attachment_data)
+                    block = _re.sub(r'<a\s+href=\"([^\"]+)\">(.*?)</a>(?!\s*\()', r'<a href="\1">\2</a> (<span class="link-href">\1</span>)', block, flags=_re.I|_re.S)
+                    block = _re.sub(r"<a\s+href='([^']+)'>(.*?)</a>(?!\s*\()", r'<a href="\1">\2</a> (<span class="link-href">\1</span>)', block, flags=_re.I|_re.S)
+                except Exception:
+                    block = str(attachment_data)
+                body_parts.append(block)
                 continue
 
             # --- Requirements ---
@@ -3478,7 +3914,11 @@ class MainWindow(QMainWindow):
 
             # --- Normal body text ---
             if text:
-                body_parts.append(f'<p id="{anchor_id}" class="body-text">{html.escape(text)}</p>')
+                import re as _re
+                safe = html.escape(text)
+                # Auto-link URLs and also show the URL in parentheses
+                safe = _re.sub(r'(https?://[\w\-./?#%&=:+,~]+)', r'<a href="\1">\1</a> (<span class="link-href">\1</span>)', safe)
+                body_parts.append(f'<p id="{anchor_id}" class="body-text">{safe}</p>')
 
         # --- TOC / Lists ---
         toc_html = ""
@@ -3511,11 +3951,74 @@ class MainWindow(QMainWindow):
 
         body_html = "\n".join(body_parts) if body_parts else "<p>No requirement content available.</p>"
 
+        # Build paged preview scaffolding (fallback shows continuous content)
+        page_header = (
+            f"<div class='page-header'>"
+            f"<div class='page-title'>{html.escape(str(settings.get('document_title','')) or 'Requirement Document')}</div>"
+            f"<div class='page-meta'>{html.escape(str(settings.get('document_number','')))}</div>"
+            f"</div>"
+        )
+        page_footer = (
+            f"<div class='page-footer'>"
+            f"{html.escape(str(settings.get('copyright_notice','')))}"
+            f"</div>"
+        )
+
+        content = f"{toc_html}{figures_html}{tables_html}{body_html}"
+        fallback_framed = f"<div id='fallback-framed' class='page-frame'>{page_header}{front_page_html}{content}{page_footer}</div>"
+        raw_block = f"<div id='raw-content' style='display:none'>{front_page_html}{content}</div>"
+        pages_block = "<div id='pages' aria-label='paged-preview' style='display:none'></div>"
+
+        pager_js = """
+        <script>
+        (function(){
+          function paginate(){
+            try{
+              var b = document.body;
+              if(!b || !(b.dataset && b.dataset.paged)) return;
+              var pages = document.getElementById('pages');
+              var raw = document.getElementById('raw-content');
+              var fallback = document.getElementById('fallback-framed');
+              if(!pages || !raw) return;
+              var headerHTML = %s;
+              var footerHTML = %s;
+              var wmText = (b.getAttribute('data-watermark')||'');
+              function newPage(idx){
+                var div = document.createElement('div');
+                div.className = 'page-frame';
+                div.innerHTML = headerHTML + "<div class='page-body'></div>" + footerHTML;
+                try{ var f = div.querySelector('.page-footer'); if(f){ var n = document.createElement('div'); n.style.marginTop='4px'; n.style.fontSize='10pt'; n.textContent = 'Page ' + idx; f.appendChild(n);} }catch(_e){}
+                if(wmText){ var overlay = document.createElement('div'); overlay.className = 'wm-overlay'; overlay.textContent = wmText; div.appendChild(overlay); }
+                pages.appendChild(div);
+                return div;
+              }
+              pages.innerHTML = '';
+              var pageIndex = 1; var page = newPage(pageIndex); var body = page.querySelector('.page-body');
+              function overflows(){ return body.scrollHeight > body.clientHeight + 1; }
+              while(raw.firstChild){ var node = raw.firstChild; body.appendChild(node); if(overflows()){ body.removeChild(node); pageIndex += 1; page = newPage(pageIndex); body = page.querySelector('.page-body'); body.appendChild(node);} }
+              pages.style.display = '';
+              var gwm = document.getElementById('wm-global'); if(gwm) gwm.style.display='none';
+              if(fallback) fallback.style.display = 'none';
+            }catch(e){}
+          }
+          if(document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', paginate); } else { setTimeout(paginate, 0); }
+        })();
+        </script>
+        """ % (json.dumps(page_header), json.dumps(page_footer))
+
+        # If paged flag is explicitly provided, tailor the blocks to avoid
+        # duplicate content in QTextBrowser (which does not honor display:none reliably).
+        if paged is True:
+            body_blocks = f"{pages_block}{fallback_framed}{raw_block}"
+        elif paged is False:
+            body_blocks = fallback_framed
+        else:
+            body_blocks = f"{pages_block}{fallback_framed}{raw_block}"
+
         return (
-            f"<html><head>{styles}</head><body>"
-            f"{wm_div}{front_page_html}"
-            '<div class="page-separator"></div>'
-            f"{toc_html}{figures_html}{tables_html}{body_html}"
+            f"<html><head>{styles}{pager_js}</head><body>"
+            f"{wm_div}"
+            f"{body_blocks}"
             "</body></html>"
         )
 
@@ -3739,8 +4242,30 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def update_word_preview(self) -> None:
-        html_content = self.compose_preview_html()
-        self.word_preview.setHtml(html_content)
+        # Guard during early init: header profiles may not be ready yet
+        if not hasattr(self, "header_profiles") or not hasattr(self, "default_header_settings"):
+            return
+
+        html_content = self.compose_preview_html(paged=getattr(self, "use_paged_preview", False))
+        # If paged preview is toggled on, add a CSS/JS hint regardless of engine availability
+        if getattr(self, "use_paged_preview", False):
+            try:
+                settings = self._get_header_settings()
+                wm_text = html.escape(str(settings.get("watermark_text", "") or ""), quote=True)
+            except Exception:
+                wm_text = ""
+            attrs = " data-paged='1'" + (f" data-watermark='{wm_text}'" if wm_text else "")
+            html_content = html_content.replace("<body>", f"<body{attrs}>", 1)
+
+        if self.web_preview is not None and getattr(self, "use_paged_preview", False):
+            # Hide fallback frame immediately to avoid duplicate rendering in paged mode
+            html_content = html_content.replace("id='fallback-framed'", "id='fallback-framed' style='display:none'", 1)
+            self.view_stack.setCurrentWidget(self.web_preview)
+            self.web_preview.setHtml(html_content)
+        else:
+            self.view_stack.setCurrentWidget(self.word_preview)
+            # In QTextBrowser mode, ensure paged-only blocks are removed
+            self.word_preview.setHtml(html_content)
 
     # ------------------------------------------------------------------
     def undo_last(self) -> None:
@@ -3771,19 +4296,43 @@ class MainWindow(QMainWindow):
                 except Exception:
                     df = None
 
-            # Compose the HTML (use main composer)
-            html = self.compose_preview_html(df) if hasattr(self, "compose_preview_html") else ""
+        except Exception as _prep_exc:
+            try:
+                if hasattr(self, "log_console"):
+                    self.log_console(f"Preview prep error: {_prep_exc}")
+            except Exception:
+                pass
+        # Compose the HTML (use main composer)
+        html = self.compose_preview_html(df, paged=getattr(self, "use_paged_preview", False)) if hasattr(self, "compose_preview_html") else ""
 
-            # Push to the preview widget and switch view
+        # Push to the appropriate preview widget (paged vs. normal)
+        use_paged = bool(getattr(self, "use_paged_preview", False))
+        html_final = (html or "")
+        if use_paged:
+            try:
+                settings = self._get_header_settings()
+                wm_text = html.escape(str(settings.get("watermark_text", "") or ""), quote=True)
+            except Exception:
+                wm_text = ""
+            attrs = " data-paged='1'" + (f" data-watermark='{wm_text}'" if wm_text else "")
+            html_final = html_final.replace("<body>", f"<body{attrs}>", 1)
+
+        if getattr(self, "web_preview", None) is not None and use_paged:
+            try:
+                # Hide fallback frame to avoid duplicate content in paged mode
+                html_final = html_final.replace("id='fallback-framed'", "id='fallback-framed' style='display:none'", 1)
+                self.web_preview.setHtml(html_final)
+                self.view_stack.setCurrentWidget(self.web_preview)
+            except Exception:
+                # Fallback to QTextBrowser
+                if hasattr(self, "word_preview") and self.word_preview is not None:
+                    self.word_preview.setHtml(html_final)
+                    self.view_stack.setCurrentWidget(self.word_preview)
+        else:
+            # No WebEngine or not using paged mode: render in QTextBrowser
             if hasattr(self, "word_preview") and self.word_preview is not None:
-                self.word_preview.setHtml(html or "")
-                if hasattr(self, "view_stack"):
-                    try:
-                        self.view_stack.setCurrentWidget(self.word_preview)
-                    except Exception:
-                        pass
-            elif hasattr(self, "preview") and self.preview is not None:
-                self.preview.setHtml(html or "")
+                self.word_preview.setHtml(html_final)
+                self.view_stack.setCurrentWidget(self.word_preview)
 
             # Rebuild Navigation based on the same df (best-effort)
             try:
@@ -3798,12 +4347,7 @@ class MainWindow(QMainWindow):
             if hasattr(self, "log_console"):
                 self.log_console("Word preview generated.")
 
-        except Exception as exc:
-            if hasattr(self, "log_console"):
-                self.log_console(f"Error generating Word preview: {exc}")
-
-
-
+        
 
     # ------------------------------------------------------------------
     def show_table_view(self) -> None:
@@ -4075,11 +4619,23 @@ class MainWindow(QMainWindow):
         normal_style.font.name = "Arial"
         normal_style.font.size = Pt(11)
 
-        for style_name, size in (("Heading 1", 12), ("Heading 2", 12), ("Heading 3", 11)):
-            style = document.styles[style_name]
-            style.font.name = "Arial"
-            style.font.size = Pt(size)
-            style.font.bold = True
+        # Ensure Heading 1..10 use Arial 12pt Bold (fallback to nearest if style missing)
+        for n in range(1, 11):
+            style_name = f"Heading {n}"
+            try:
+                style = document.styles[style_name]
+            except Exception:
+                # Fallback: reuse Heading 9 for 10 if missing
+                try:
+                    style = document.styles["Heading 9"]
+                except Exception:
+                    continue
+            try:
+                style.font.name = "Arial"
+                style.font.size = Pt(12)
+                style.font.bold = True
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     def _apply_page_border(self, section, OxmlElement, qn) -> None:
@@ -4458,10 +5014,16 @@ class MainWindow(QMainWindow):
 
         def _extract_caption(text: str, kind: str) -> tuple[bool, str]:
             t = str(text or "").strip()
-            m = _rx_table.match(t) if kind == "table" else _rx_figure.match(t)
-            if not m:
+            if kind == "table":
+                # Accept 'Table 3: ...', 'Table No: 3 ...', and 'Table :'
+                if _re.match(r"^\s*table\s*(?:no\.?|number)?\s*[:\-]?\s*(\d+)?", t, flags=_re.IGNORECASE):
+                    return True, t
                 return False, ""
-            return True, (m.group(2) or "").strip()
+            else:
+                m = _rx_figure.match(t)
+                if not m:
+                    return False, ""
+                return True, t
 
         def _find_adjacent_caption(idx: int, kind: str) -> tuple[int | None, str]:
             prefer_above = (kind == "table")
@@ -4474,9 +5036,9 @@ class MainWindow(QMainWindow):
                 if att_j:
                     continue
                 txt = str(rowj.get("Object Text", "")).strip()
-                ok, tail = _extract_caption(txt, kind)
+                ok, full = _extract_caption(txt, kind)
                 if ok:
-                    return j, tail
+                    return j, full
             return None, ""
 
         for _pos in range(len(df)):
@@ -4491,18 +5053,48 @@ class MainWindow(QMainWindow):
 
             is_attachment = attachment_type in {"table", "image"} and bool(attachment_data)
 
+            # Skip caption Text rows that are positioned ABOVE a table to avoid duplicate rendering
+            if not is_attachment:
+                if str(row.get("Object Type", "")).strip().lower() == "text":
+                    ok_cap, _tail = _extract_caption(text_value, "table")
+                    if ok_cap and (_pos + 1) < len(df):
+                        try:
+                            nxt = df.iloc[_pos + 1]
+                            att_nxt = str(nxt.get("Attachment Type", "") or "").strip().lower()
+                            if att_nxt == "table":
+                                # table will render its own caption; skip this text row
+                                continue
+                        except Exception:
+                            pass
+
             if obj_type.startswith("heading"):
+                # Always draw a split line BEFORE a heading. If we were
+                # waiting to place a rule after a requirement block, that
+                # intent is satisfied by the same line – so just clear the
+                # pending flag to avoid duplicate rules.
                 if pending_requirement_rule:
-                    maybe_add_horizontal_rule()
                     pending_requirement_rule = False
                 try:
                     level = _heading_level_from_type(obj_type) or 1
                     level = max(1, min(level, 9))
                 except ValueError:
                     level = 1
-                heading_text = f"{section} {text_value}".strip() or text_value or section or "Heading"
-                document.add_heading(heading_text, level=level)
+                # Deduplicate numeric prefix in heading text
+                import re as _re
+                heading_text = str(text_value or "")
+                if section:
+                    m = _re.match(r"^\s*(\d+(?:\.\d+)*)\s+(.*)$", heading_text)
+                    if m:
+                        head_num, rest = m.group(1), m.group(2)
+                        if head_num == section:
+                            heading_text = f"{head_num} {rest}".strip()
+                        else:
+                            heading_text = f"{section} {rest}".strip()
+                    else:
+                        heading_text = f"{section} {heading_text}".strip()
+                # Insert horizontal rule BEFORE every heading
                 maybe_add_horizontal_rule()
+                document.add_heading(heading_text or (section or "Heading"), level=level)
                 continue
 
             if attachment_type == "table" and attachment_data:
@@ -4561,15 +5153,33 @@ class MainWindow(QMainWindow):
                 label_run.bold = True
                 value_run = paragraph.add_run(req_id)
                 value_run.bold = False
-                if text_value:
-                    text_para = document.add_paragraph(text_value)
+                # Prefer rich HTML content when available; else auto-link URLs and map to runs
+                if attachment_type == "html" and attachment_data:
+                    text_para = document.add_paragraph()
+                    self._add_html_paragraph(text_para, attachment_data)
+                    text_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                elif text_value:
+                    import re as _re
+                    safe = html.escape(text_value)
+                    safe = _re.sub(r'(https?://[\w\-./?#%&=:+,~]+)', r'<a href="\1">\1</a> (\1)', safe)
+                    text_para = document.add_paragraph()
+                    self._add_html_paragraph(text_para, f"<p>{safe}</p>")
                     text_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
                 pending_requirement_rule = True
                 continue
 
             if text_value and (_pos not in used_caption_rows):
-                paragraph = document.add_paragraph(text_value)
-                paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                if attachment_type == "html" and attachment_data:
+                    para = document.add_paragraph()
+                    self._add_html_paragraph(para, attachment_data)
+                    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                else:
+                    import re as _re
+                    safe = html.escape(text_value)
+                    safe = _re.sub(r'(https?://[\w\-./?#%&=:+,~]+)', r'<a href="\1">\1</a> (\1)', safe)
+                    para = document.add_paragraph()
+                    self._add_html_paragraph(para, f"<p>{safe}</p>")
+                    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
         if pending_requirement_rule:
             maybe_add_horizontal_rule()
@@ -4668,6 +5278,85 @@ class MainWindow(QMainWindow):
         tail_run = caption_para.add_run(tail_text)
         tail_run.font.bold = False
         tail_run.font.color.rgb = RGBColor(0, 0, 0)
+
+    def _add_html_paragraph(self, paragraph, html_block: str) -> None:
+        """Render a small subset of HTML into the given Word paragraph.
+        Supports <p>, <br>, <strong>/<b>, <em>/<i>, <u>, and <a href>.
+        Additional paragraphs are created for subsequent <p> blocks.
+        """
+        try:
+            from bs4 import BeautifulSoup
+            from bs4.element import NavigableString, Tag
+        except Exception:
+            # Fallback: strip tags
+            import re as _re
+            text = _re.sub(r"<[^>]+>", "", str(html_block or ""))
+            paragraph.add_run(text)
+            return
+
+        soup = BeautifulSoup(html_block or "", "html.parser")
+
+        def apply_run(para, text, bold=False, italic=False, underline=False):
+            if not text:
+                return
+            run = para.add_run(text)
+            try:
+                run.bold = bool(bold)
+                run.italic = bool(italic)
+                run.underline = bool(underline)
+            except Exception:
+                pass
+
+        def walk(node, para, bold=False, italic=False, underline=False):
+            if isinstance(node, NavigableString):
+                apply_run(para, str(node), bold, italic, underline)
+                return
+            if not isinstance(node, Tag):
+                return
+
+            name = node.name.lower()
+            b = bold or name in ("strong", "b")
+            i = italic or name in ("em", "i")
+            u = underline or name in ("u",)
+
+            if name == "br":
+                try:
+                    para.add_run().add_break()
+                except Exception:
+                    apply_run(para, "\n", b, i, u)
+                return
+            if name == "a":
+                href = node.get("href") or ""
+                # Emit anchor text
+                for child in node.children:
+                    walk(child, para, b, i, u)
+                # Emit the target in parentheses if present (to mirror preview)
+                if href:
+                    apply_run(para, f" ({href})", b, i, u)
+                return
+
+            # Generic container: recurse
+            for child in node.children:
+                walk(child, para, b, i, u)
+
+        # If there are explicit <p> blocks, use one paragraph per block
+        ps = soup.find_all("p")
+        if ps:
+            first = True
+            for p_tag in ps:
+                if first:
+                    target_para = paragraph
+                    first = False
+                else:
+                    parent = getattr(paragraph, "_parent", None)
+                    target_para = parent.add_paragraph() if parent is not None and hasattr(parent, "add_paragraph") else paragraph
+                for child in p_tag.children:
+                    walk(child, target_para)
+            return
+
+        # Otherwise, render inline content into the provided paragraph
+        for child in soup.children:
+            walk(child, paragraph)
 
 
     def _apply_watermark(self, document, text: str, parse_xml, nsdecls) -> None:
@@ -5198,6 +5887,11 @@ class MainWindow(QMainWindow):
     def _set_object_type_cell(self, table: QTableWidget, row: int, df_index: int, current_value: str) -> None:
         """Place a QComboBox in the 'Object Type' column with allowed values."""
         combo = QComboBox(table)
+        combo.setEditable(True)
+        try:
+            combo.setStyleSheet("QComboBox { padding-left: 6px; }")
+        except Exception:
+            pass
         combo.addItems(self._object_types)
         # Pick the closest match; default to original string if it's custom
         try:
@@ -5219,6 +5913,11 @@ class MainWindow(QMainWindow):
         except RequirementDataError as exc:
             QMessageBox.warning(self, "Edit Error", str(exc))
             return
+        try:
+            if getattr(self, "_auto_renumber_from_index", None) is not None and str(getattr(self, "_auto_renumber_base", "")).strip():
+                self.data_manager.renumber_headings_from(int(self._auto_renumber_from_index), str(self._auto_renumber_base))
+        except Exception:
+            pass
         refreshed = self.data_manager.refresh_dataframe()
         self._undo_stack.append(refreshed.copy())
         self.populate_table()
